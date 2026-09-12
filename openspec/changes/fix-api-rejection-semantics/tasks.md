@@ -50,4 +50,4 @@
 
 ## 8. Close the coverage gap that hid this
 
-- [ ] 8.1 Add a CI job that starts a Temporal dev server, runs `encore run` in the background, waits for health, and executes the end-to-end suite with `FEES_API_BASE_URL` set, and verify it fails when the closed-bill fix is reverted
+- [x] 8.1 Add a CI job that starts a Temporal dev server, runs `encore run` in the background, waits for health, and executes the end-to-end suite with `FEES_API_BASE_URL` set, and verify it fails when the closed-bill fix is reverted

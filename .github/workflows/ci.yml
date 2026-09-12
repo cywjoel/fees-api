@@ -67,3 +67,78 @@ jobs:
 
       - name: Run Encore tests
         run: encore test ./...
+
+  # The end-to-end suite, against a real service.
+  #
+  # It existed from the first commit and guarded nothing: every case is skipped
+  # unless FEES_API_BASE_URL is set, which no job set. One of those skipped cases
+  # asserted the status a charge on a closed bill must get, and the service was
+  # answering 404 where it asserted 409 - a defect the suite would have caught on
+  # the first push had it ever run. Hence this job.
+  e2e:
+    name: End-to-end
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.26'
+          cache: true
+
+      - name: Install Encore
+        run: |
+          curl -L https://encore.dev/install.sh | bash
+          echo "$HOME/.encore/bin" >> "$GITHUB_PATH"
+
+      - name: Install the Temporal CLI
+        run: |
+          curl -sSf https://temporal.download/cli.sh | sh
+          echo "$HOME/.temporalio/bin" >> "$GITHUB_PATH"
+
+      - name: Start the Temporal dev server
+        run: |
+          temporal server start-dev --headless --ip 127.0.0.1 --port 7233 \
+            --db-filename /tmp/temporal-ci.db &
+          for i in $(seq 1 60); do
+            if temporal operator cluster health --address 127.0.0.1:7233 >/dev/null 2>&1; then
+              echo "temporal ready after ${i}s"; exit 0
+            fi
+            sleep 1
+          done
+          echo "temporal did not become healthy"; exit 1
+
+      - name: Start the API
+        run: |
+          encore run --port 4000 > /tmp/encore.log 2>&1 &
+          for i in $(seq 1 180); do
+            if curl -fsS --max-time 2 http://127.0.0.1:4000/health >/dev/null 2>&1; then
+              echo "api ready after ${i}s"; exit 0
+            fi
+            sleep 1
+          done
+          echo "api did not become healthy:"; tail -40 /tmp/encore.log; exit 1
+
+      - name: Run the end-to-end suite
+        env:
+          FEES_API_BASE_URL: http://127.0.0.1:4000
+        run: go test ./e2e/ -count=1 -v
+
+      # A suite that silently skips is worse than no suite: it reports success
+      # for assertions nobody ran. This fails the job if the guard above ever
+      # stops applying.
+      - name: Fail if the suite skipped instead of running
+        env:
+          FEES_API_BASE_URL: http://127.0.0.1:4000
+        run: |
+          out="$(go test ./e2e/ -count=1 -v 2>&1)"
+          if echo "$out" | grep -q -- '--- SKIP'; then
+            echo "end-to-end cases were skipped:"
+            echo "$out" | grep -- '--- SKIP'
+            exit 1
+          fi
+          echo "ran $(echo "$out" | grep -c -- '--- PASS') cases, none skipped"
+
+      - name: Show the API log on failure
+        if: failure()
+        run: tail -100 /tmp/encore.log
