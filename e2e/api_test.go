@@ -104,14 +104,26 @@ func do(t *testing.T, method, path string, body any, headers map[string]string) 
 }
 
 // createBill opens a bill whose period runs for the given duration.
+//
+// Each call reads the clock afresh, so two calls describe two different fee
+// periods. That is fine for creating unrelated bills, but it must not be used to
+// model a retry: a repeat carrying the same idempotency key and a period a few
+// milliseconds different is a different request, and is refused as key reuse.
+// Use createBillBody for a retry, which resends identical bytes the way a client
+// retrying a failed call actually would.
 func createBill(t *testing.T, currency string, period time.Duration, headers map[string]string) response {
 	t.Helper()
+	return do(t, http.MethodPost, "/bills", createBillBody(currency, period), headers)
+}
+
+// createBillBody builds a creation request that can be sent more than once.
+func createBillBody(currency string, period time.Duration) map[string]any {
 	now := time.Now().UTC()
-	return do(t, http.MethodPost, "/bills", map[string]any{
+	return map[string]any{
 		"currency":    currency,
 		"periodStart": now.Format(time.RFC3339Nano),
 		"periodEnd":   now.Add(period).Format(time.RFC3339Nano),
-	}, headers)
+	}
 }
 
 func addItem(t *testing.T, billID, itemID string, minorUnits int64, currency, desc string) response {
@@ -188,6 +200,10 @@ func TestConcurrentCreationsSharingAKeyReportOneCreation(t *testing.T) {
 	key := fmt.Sprintf("concurrent-%d", time.Now().UnixNano())
 	headers := map[string]string{"Idempotency-Key": key}
 
+	// One body shared by every goroutine: this tests concurrent retries of the
+	// same request, not four different requests wearing one key.
+	body := createBillBody("USD", time.Hour)
+
 	var (
 		wg      sync.WaitGroup
 		mu      sync.Mutex
@@ -197,7 +213,7 @@ func TestConcurrentCreationsSharingAKeyReportOneCreation(t *testing.T) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			r := createBill(t, "USD", time.Hour, headers)
+			r := do(t, http.MethodPost, "/bills", body, headers)
 			mu.Lock()
 			results = append(results, r)
 			mu.Unlock()
@@ -392,14 +408,18 @@ func TestCreateBillIsIdempotentByKey(t *testing.T) {
 	key := fmt.Sprintf("key-%d", time.Now().UnixNano())
 	headers := map[string]string{"Idempotency-Key": key}
 
-	first := createBill(t, "USD", time.Hour, headers)
+	// One body, sent three times, as a retrying client would send it.
+	body := createBillBody("USD", time.Hour)
+
+	first := do(t, http.MethodPost, "/bills", body, headers)
 	if first.status != http.StatusCreated {
 		t.Fatalf("first POST /bills = %d, want 201 (%s)", first.status, first.raw)
 	}
 	billID := billIDOf(t, first)
 
-	// The bill is still open, so the conflict policy returns the running one.
-	second := createBill(t, "USD", time.Hour, headers)
+	// The bill is still open, so the start attaches to the running execution and
+	// reports that it did not create it.
+	second := do(t, http.MethodPost, "/bills", body, headers)
 	if second.status != http.StatusOK {
 		t.Fatalf("repeat POST /bills while open = %d, want 200 (%s)", second.status, second.raw)
 	}
@@ -414,7 +434,7 @@ func TestCreateBillIsIdempotentByKey(t *testing.T) {
 	}
 	waitForState(t, billID, "CLOSED", 30*time.Second)
 
-	third := createBill(t, "USD", time.Hour, headers)
+	third := do(t, http.MethodPost, "/bills", body, headers)
 	if third.status != http.StatusOK {
 		t.Fatalf("repeat POST /bills after close = %d, want 200 (%s)", third.status, third.raw)
 	}

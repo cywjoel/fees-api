@@ -46,6 +46,7 @@ var reasonStatus = map[string]int{
 	billflow.ReasonInvalidBill:         http.StatusUnprocessableEntity,
 	billflow.ReasonInternal:            http.StatusInternalServerError,
 	reasonUnavailable:                  http.StatusServiceUnavailable,
+	reasonKeyReuse:                     http.StatusConflict,
 }
 
 var reasonTitle = map[string]string{
@@ -58,10 +59,16 @@ var reasonTitle = map[string]string{
 	billflow.ReasonInvalidBill:         "Bill is missing required detail",
 	billflow.ReasonInternal:            "Internal error",
 	reasonUnavailable:                  "Bill state is temporarily unavailable",
+	reasonKeyReuse:                     "Idempotency key already used for a different bill",
 }
 
 // reasonNotFound is used when no bill exists, in the workflow or in storage.
 const reasonNotFound = "bill_not_found"
+
+// reasonKeyReuse reports that an idempotency key was reused for a request that
+// differs from the one it first satisfied. It is a contradiction, not a retry,
+// so it is a 409 - consistent with reusing a line item id for a different charge.
+const reasonKeyReuse = "idempotency_key_reuse"
 
 // reasonUnavailable reports that the system could not determine a bill's state,
 // because the workflow holding it could not be reached in time.

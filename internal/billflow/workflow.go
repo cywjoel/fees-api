@@ -35,6 +35,15 @@ import (
 // TaskQueue is the queue the bill workflow and its activities run on.
 const TaskQueue = "fees-api-bills"
 
+// WorkflowTypeName is the name the bill workflow is registered under, and the
+// name a start request must ask for.
+//
+// It is a constant because bill creation starts the workflow through the raw
+// service API rather than the SDK helper, and so has to name the type itself.
+// Registration uses this same constant, so the two cannot drift - and it matches
+// the type recorded in the committed replay fixtures, which must keep replaying.
+const WorkflowTypeName = "BillWorkflow"
+
 // Update, query, and activity names. They are part of the workflow's contract
 // with its callers and its worker, so they are named constants rather than
 // literals scattered across the codebase.

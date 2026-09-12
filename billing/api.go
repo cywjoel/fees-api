@@ -12,7 +12,10 @@ import (
 	"time"
 
 	"encore.dev"
+	commonpb "go.temporal.io/api/common/v1"
 	enumspb "go.temporal.io/api/enums/v1"
+	taskqueuepb "go.temporal.io/api/taskqueue/v1"
+	"go.temporal.io/api/workflowservice/v1"
 	"go.temporal.io/sdk/client"
 
 	"fees-api/internal/bill"
@@ -51,6 +54,35 @@ type CreateBillRequest struct {
 type AddLineItemRequest struct {
 	Amount      money.Money `json:"amount"`
 	Description string      `json:"description"`
+}
+
+// matchesRequest reports whether an existing bill is the one this request asked
+// for. It is the check that makes an idempotency key safe to reuse by accident:
+// without it, a key reused with different parameters is answered with a bill in
+// the wrong currency, for the wrong period, and the caller is never told.
+//
+// Nothing needs to be stored to do this. The request is exactly a currency and a
+// fee period, and a bill carries all three, so the bill is its own record of what
+// was asked for - which keeps uniqueness coming from Temporal rather than from a
+// deduplication table.
+//
+// Instants are compared with Equal, never ==. The period comes back from the
+// workflow as UTC while a caller may have written the same moment with an offset;
+// == compares wall clock, location and monotonic reading, so it would refuse a
+// correct retry.
+func matchesRequest(snap bill.Snapshot, currency money.Currency, in CreateBillRequest) bool {
+	return snap.Currency.Code == currency.Code &&
+		snap.PeriodStart.Equal(in.PeriodStart) &&
+		snap.PeriodEnd.Equal(in.PeriodEnd)
+}
+
+// writeKeyReuse refuses a key that already named a different bill.
+func writeKeyReuse(w http.ResponseWriter, billID string, snap bill.Snapshot) {
+	writeProblem(w, http.StatusConflict, reasonKeyReuse,
+		"idempotency key already created bill "+billID+" in "+snap.Currency.Code+
+			" for "+snap.PeriodStart.UTC().Format(time.RFC3339)+" to "+
+			snap.PeriodEnd.UTC().Format(time.RFC3339)+
+			"; reusing it for different parameters would return a bill that was not asked for")
 }
 
 // CreateBill opens a new bill and starts the workflow that owns it.
@@ -98,6 +130,10 @@ func (s *Service) CreateBill(w http.ResponseWriter, req *http.Request) {
 	if keyed {
 		switch snap, readErr := s.readBill(ctx, billID); {
 		case readErr == nil:
+			if !matchesRequest(snap, currency, in) {
+				writeKeyReuse(w, billID, snap)
+				return
+			}
 			w.Header().Set("Location", "/bills/"+billID)
 			writeJSON(w, http.StatusOK, snap)
 			return
@@ -110,12 +146,7 @@ func (s *Service) CreateBill(w http.ResponseWriter, req *http.Request) {
 		}
 	}
 
-	_, err = s.temporal.ExecuteWorkflow(ctx, client.StartWorkflowOptions{
-		ID:                       billID,
-		TaskQueue:                billflow.TaskQueue,
-		WorkflowIDReusePolicy:    enumspb.WORKFLOW_ID_REUSE_POLICY_REJECT_DUPLICATE,
-		WorkflowIDConflictPolicy: enumspb.WORKFLOW_ID_CONFLICT_POLICY_USE_EXISTING,
-	}, billflow.BillWorkflow, billflow.StartBillInput{
+	started, err := s.startBillWorkflow(ctx, billID, billflow.StartBillInput{
 		BillID:      billID,
 		Currency:    currency.Code,
 		PeriodStart: in.PeriodStart,
@@ -124,9 +155,22 @@ func (s *Service) CreateBill(w http.ResponseWriter, req *http.Request) {
 	if err != nil {
 		// The key names a bill that already exists. Return it rather than a second.
 		if isWorkflowAlreadyStarted(err) {
-			if snap, readErr := s.readBill(ctx, billID); readErr == nil {
+			// This request lost the race, or repeats a key that already made a bill.
+			// Either way the bill exists; compare here as well as in the pre-check,
+			// because two concurrent requests can both pass the pre-check before
+			// either has created anything.
+			snap, readErr := s.readBill(ctx, billID)
+			if readErr == nil {
+				if !matchesRequest(snap, currency, in) {
+					writeKeyReuse(w, billID, snap)
+					return
+				}
 				w.Header().Set("Location", "/bills/"+billID)
 				writeJSON(w, http.StatusOK, snap)
+				return
+			}
+			if isWorkflowBusy(readErr) {
+				writeUnavailable(w, "the existing bill for this key could not be read: "+readErr.Error())
 				return
 			}
 		}
@@ -141,13 +185,79 @@ func (s *Service) CreateBill(w http.ResponseWriter, req *http.Request) {
 
 	snap, err := s.readBill(ctx, billID)
 	if err != nil {
+		if isWorkflowBusy(err) {
+			// The bill exists - the start succeeded - but its state cannot be read
+			// back right now. Reporting a fault would tell the caller its bill was
+			// not created, and a caller without an idempotency key that retries on
+			// that basis creates a second one. 503 asks for the retry that will
+			// return the bill, and creation is idempotent so the retry is safe.
+			writeUnavailable(w, "the bill was created but its state could not be read back: "+err.Error())
+			return
+		}
 		writeProblem(w, http.StatusInternalServerError, billflow.ReasonInternal,
 			"reading the new bill: "+err.Error())
 		return
 	}
 
+	// Only the request that actually created the execution reports 201. Without
+	// this, concurrent requests sharing a key all claim to have created the bill.
+	if !started && !matchesRequest(snap, currency, in) {
+		writeKeyReuse(w, billID, snap)
+		return
+	}
+	status := http.StatusOK
+	if started {
+		status = http.StatusCreated
+	}
+
 	w.Header().Set("Location", "/bills/"+billID)
-	writeJSON(w, http.StatusCreated, snap)
+	writeJSON(w, status, snap)
+}
+
+// startBillWorkflow starts a bill's workflow and reports whether this request is
+// the one that created it.
+//
+// It calls the service API directly rather than client.ExecuteWorkflow, because
+// the SDK helper does not surface that fact. Under any conflict policy it returns
+// the existing run handle and a nil error when the workflow is already running,
+// so a caller cannot tell creating from attaching - and every concurrent request
+// sharing an idempotency key then reports 201 Created. The raw response carries a
+// Started flag, which is exactly the missing signal.
+//
+// USE_EXISTING rather than FAIL: attaching is the ordinary outcome of a retry and
+// should not be an error path. REJECT_DUPLICATE still stands, so a key whose bill
+// has completed cannot quietly start a second one.
+func (s *Service) startBillWorkflow(ctx context.Context, billID string, in billflow.StartBillInput) (bool, error) {
+	payload, err := dataConverter.ToPayloads(in)
+	if err != nil {
+		return false, fmt.Errorf("encoding bill workflow input: %w", err)
+	}
+
+	resp, err := s.temporal.WorkflowService().StartWorkflowExecution(ctx,
+		&workflowservice.StartWorkflowExecutionRequest{
+			Namespace:    temporalNamespace(),
+			WorkflowId:   billID,
+			WorkflowType: &commonpb.WorkflowType{Name: billflow.WorkflowTypeName},
+			TaskQueue:    &taskqueuepb.TaskQueue{Name: billflow.TaskQueue},
+			Input:        payload,
+			// Identifies this attempt. Distinct per request, so two concurrent
+			// requests are two attempts and exactly one of them starts the bill; a
+			// shared value would make the server treat them as one retried request.
+			RequestId:                newRequestID(),
+			WorkflowIdReusePolicy:    enumspb.WORKFLOW_ID_REUSE_POLICY_REJECT_DUPLICATE,
+			WorkflowIdConflictPolicy: enumspb.WORKFLOW_ID_CONFLICT_POLICY_USE_EXISTING,
+		})
+	if err != nil {
+		return false, err
+	}
+	return resp.Started, nil
+}
+
+// newRequestID returns a fresh identifier for one start attempt.
+func newRequestID() string {
+	var b [16]byte
+	_, _ = rand.Read(b[:])
+	return hex.EncodeToString(b[:])
 }
 
 // AddLineItem accrues a charge onto an open bill.

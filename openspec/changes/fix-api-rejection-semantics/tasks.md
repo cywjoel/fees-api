@@ -25,10 +25,10 @@
 
 ## 4. Creation idempotency
 
-- [ ] 4.1 Change the workflow id conflict policy to `FAIL` and handle `WorkflowExecutionAlreadyStarted` as the existing-bill path, and verify task 1.4's concurrent test yields exactly one `201` and the rest `200`
-- [ ] 4.2 Compare the request's currency and fee period against the existing bill in both the pre-check and the already-started path, rejecting a mismatch with `409`, and verify task 1.5 passes
-- [ ] 4.3 Verify the period comparison uses `time.Time.Equal`, with a test that retries a creation stating the same instant in a different time zone offset and expects `200`
-- [ ] 4.4 Verify a read failure immediately after a successful start no longer reports `500` for a bill that was created
+- [x] 4.1 Change the workflow id conflict policy to `FAIL` and handle `WorkflowExecutionAlreadyStarted` as the existing-bill path, and verify task 1.4's concurrent test yields exactly one `201` and the rest `200`
+- [x] 4.2 Compare the request's currency and fee period against the existing bill in both the pre-check and the already-started path, rejecting a mismatch with `409`, and verify task 1.5 passes
+- [x] 4.3 Verify the period comparison uses `time.Time.Equal`, with a test that retries a creation stating the same instant in a different time zone offset and expects `200`
+- [x] 4.4 Verify a read failure immediately after a successful start no longer reports `500` for a bill that was created
 
 ## 5. Request validation
 
