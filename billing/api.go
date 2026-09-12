@@ -85,6 +85,29 @@ func writeKeyReuse(w http.ResponseWriter, billID string, snap bill.Snapshot) {
 			"; reusing it for different parameters would return a bill that was not asked for")
 }
 
+// validateLineItemRequest reports what is wrong with a charge before it is sent
+// anywhere, or nil if it is well formed.
+//
+// It exists because an absent amount is not caught by decoding. A body with no
+// amount leaves the zero Money, whose currency is empty; that marshals happily
+// onto the update payload and then fails to deserialise on the worker, so the
+// validator never runs and the caller is told the service broke rather than that
+// its request was malformed.
+//
+// Pure, so the rule is testable without a running workflow or a live request.
+func validateLineItemRequest(itemID string, in AddLineItemRequest) error {
+	if itemID == "" {
+		return fmt.Errorf("%w: item id is required", bill.ErrInvalidLineItem)
+	}
+	if in.Amount.Currency().IsZero() {
+		return fmt.Errorf("%w: amount and its currency are required", bill.ErrInvalidLineItem)
+	}
+	if in.Description == "" {
+		return fmt.Errorf("%w: description is required", bill.ErrInvalidLineItem)
+	}
+	return nil
+}
+
 // CreateBill opens a new bill and starts the workflow that owns it.
 //
 // Creation is idempotent through the Idempotency-Key header, which is mapped
@@ -119,6 +142,15 @@ func (s *Service) CreateBill(w http.ResponseWriter, req *http.Request) {
 	if !in.PeriodEnd.After(in.PeriodStart) {
 		writeProblem(w, http.StatusUnprocessableEntity, billflow.ReasonInvalidPeriod,
 			"periodEnd must be strictly after periodStart")
+		return
+	}
+	if !in.PeriodEnd.After(time.Now()) {
+		// A bill accrues charges over a period that is still running. One whose
+		// period has ended builds a timer with a negative duration, fires it at
+		// once, and is closing before the caller has read the response saying it
+		// was created - a 201 for a bill that can never take a charge.
+		writeProblem(w, http.StatusUnprocessableEntity, billflow.ReasonInvalidPeriod,
+			"periodEnd is in the past; a bill cannot accrue charges over a period that has already ended")
 		return
 	}
 
@@ -290,6 +322,11 @@ func (s *Service) AddLineItem(w http.ResponseWriter, req *http.Request) {
 	if err := json.NewDecoder(req.Body).Decode(&in); err != nil {
 		writeProblem(w, http.StatusUnprocessableEntity, billflow.ReasonInvalidLineItem,
 			"request body is not a valid line item: "+err.Error())
+		return
+	}
+
+	if err := validateLineItemRequest(itemID, in); err != nil {
+		writeProblem(w, statusForDomainError(err), billflow.ClassifyRejection(err), err.Error())
 		return
 	}
 

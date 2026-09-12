@@ -238,7 +238,15 @@ func BillWorkflow(ctx workflow.Context, in StartBillInput) (bill.Snapshot, error
 	// Temporal timer built from workflow.Now - never time.Now, which would be
 	// non-deterministic on replay and would break every in-flight bill the moment
 	// a worker restarted.
-	periodTimer := workflow.NewTimer(ctx, b.PeriodEnd().Sub(workflow.Now(ctx)))
+	// Clamped at zero. A period already past yields a negative duration, and while
+	// the API refuses such a period, the workflow must not depend on that: a bill
+	// started by any other route should close at once rather than on a timer whose
+	// duration is meaningless.
+	untilPeriodEnd := b.PeriodEnd().Sub(workflow.Now(ctx))
+	if untilPeriodEnd < 0 {
+		untilPeriodEnd = 0
+	}
+	periodTimer := workflow.NewTimer(ctx, untilPeriodEnd)
 
 	selector := workflow.NewSelector(ctx)
 	selector.AddFuture(periodTimer, func(workflow.Future) {
