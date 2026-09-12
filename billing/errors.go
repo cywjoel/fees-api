@@ -1,9 +1,12 @@
 package billing
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"net/http"
+	"strconv"
+	"time"
 
 	"go.temporal.io/api/serviceerror"
 	"go.temporal.io/sdk/temporal"
@@ -42,6 +45,7 @@ var reasonStatus = map[string]int{
 	billflow.ReasonUnsupportedCurrency: http.StatusUnprocessableEntity,
 	billflow.ReasonInvalidBill:         http.StatusUnprocessableEntity,
 	billflow.ReasonInternal:            http.StatusInternalServerError,
+	reasonUnavailable:                  http.StatusServiceUnavailable,
 }
 
 var reasonTitle = map[string]string{
@@ -53,10 +57,26 @@ var reasonTitle = map[string]string{
 	billflow.ReasonUnsupportedCurrency: "Unsupported currency",
 	billflow.ReasonInvalidBill:         "Bill is missing required detail",
 	billflow.ReasonInternal:            "Internal error",
+	reasonUnavailable:                  "Bill state is temporarily unavailable",
 }
 
 // reasonNotFound is used when no bill exists, in the workflow or in storage.
 const reasonNotFound = "bill_not_found"
+
+// reasonUnavailable reports that the system could not determine a bill's state,
+// because the workflow holding it could not be reached in time.
+//
+// It is deliberately distinct from reasonNotFound. "I cannot reach it" and "it
+// does not exist" call for opposite responses from a caller: the first should be
+// retried, the second must not be. Reporting the first as the second invites a
+// client to conclude its bill was never created, or that a charge it made was
+// never recorded, and to act on that.
+const reasonUnavailable = "temporarily_unavailable"
+
+// retryAfter is advertised on a 503. The failures it covers are transport
+// hiccups and momentarily busy workflows, which clear in seconds rather than
+// minutes; a short interval is more useful to a caller than a conservative one.
+const retryAfter = 2 * time.Second
 
 // writeJSON writes a success response.
 func writeJSON(w http.ResponseWriter, status int, body any) {
@@ -95,6 +115,14 @@ func writeNotFound(w http.ResponseWriter, billID string) {
 	})
 }
 
+// writeUnavailable reports that the bill could not be reached, and says when to
+// try again. The Retry-After header is the actionable half: without it a caller
+// has no way to tell a transient 503 from a permanent one.
+func writeUnavailable(w http.ResponseWriter, detail string) {
+	w.Header().Set("Retry-After", strconv.Itoa(int(retryAfter.Seconds())))
+	writeProblem(w, http.StatusServiceUnavailable, reasonUnavailable, detail)
+}
+
 // writeRejection translates an error returned by a Temporal update into an HTTP
 // response.
 //
@@ -116,21 +144,71 @@ func writeRejection(w http.ResponseWriter, err error) {
 	writeProblem(w, http.StatusInternalServerError, billflow.ReasonInternal, err.Error())
 }
 
-// isWorkflowGone reports whether err means the workflow is no longer available
-// to serve an update or query - because it has completed and aged out, or never
-// existed. It is the signal to fall back to durable storage.
-func isWorkflowGone(err error) bool {
+// The three questions that replace a single "is the workflow gone?".
+//
+// That one predicate answered true for three unrelated conditions, and every
+// true became a 404. Only one of them means the bill is absent; the other two
+// describe a workflow that is very much present. They are separated here because
+// the caller must act differently on each:
+//
+//	absent         -> durable storage is the only source; 404 only if it has nothing
+//	busy           -> 503 with Retry-After; the bill exists and will answer later
+//	already started -> the execution exists right now; creation's "already exists" path
+//
+// Keeping them apart is what stops a momentary hiccup being reported as a
+// deleted bill.
+
+// isWorkflowAbsent reports whether the workflow is not there to be asked or acted
+// on - it never existed, its history has aged out, or it has completed and so can
+// no longer accept an update. In every case durable storage is the only remaining
+// source of truth for the bill, which may still hold its invoice.
+func isWorkflowAbsent(err error) bool {
 	if err == nil {
 		return false
 	}
 	var notFound *serviceerror.NotFound
-	if errors.As(err, &notFound) {
-		return true
+	return errors.As(err, &notFound)
+}
+
+// isWorkflowBusy reports whether the failure is transient - the workflow service
+// was unreachable, overloaded, or the execution was momentarily unable to answer.
+//
+// None of these say anything about whether the bill exists, which is precisely
+// why they must not reach storage: an open bill has no persisted row until it
+// closes, so falling back would answer "no such bill" for a bill that is running
+// and accruing charges.
+func isWorkflowBusy(err error) bool {
+	if err == nil {
+		return false
 	}
-	var alreadyCompleted *serviceerror.WorkflowNotReady
-	if errors.As(err, &alreadyCompleted) {
+	var (
+		unavailable *serviceerror.Unavailable
+		notReady    *serviceerror.WorkflowNotReady
+		deadline    *serviceerror.DeadlineExceeded
+		exhausted   *serviceerror.ResourceExhausted
+	)
+	switch {
+	case errors.As(err, &unavailable),
+		errors.As(err, &notReady),
+		errors.As(err, &deadline),
+		errors.As(err, &exhausted),
+		errors.Is(err, context.DeadlineExceeded):
 		return true
+	default:
+		return false
 	}
-	var execAlreadyStarted *serviceerror.WorkflowExecutionAlreadyStarted
-	return errors.As(err, &execAlreadyStarted)
+}
+
+// isWorkflowAlreadyStarted reports whether a start request collided with an
+// execution that already exists.
+//
+// This is the opposite of absence, and it is useful in exactly one place: bill
+// creation, where it means the idempotency key has already produced a bill. It
+// must never be read as the bill being missing.
+func isWorkflowAlreadyStarted(err error) bool {
+	if err == nil {
+		return false
+	}
+	var alreadyStarted *serviceerror.WorkflowExecutionAlreadyStarted
+	return errors.As(err, &alreadyStarted)
 }

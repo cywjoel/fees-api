@@ -9,11 +9,11 @@
 
 ## 2. Separate absence from unavailability
 
-- [ ] 2.1 Replace `isWorkflowGone` in `billing/errors.go` with predicates distinguishing absent, completed, transient, and already-started, and verify task 1.1's test passes without loosening its assertions
-- [ ] 2.2 Add the transient rejection reason and its `503` mapping to `reasonStatus` and `reasonTitle`, and verify a `503` response carries `Retry-After` and a machine-readable reason
-- [ ] 2.3 Narrow `readBill` so storage is consulted only for an absent or completed execution, propagating every other error including the currently discarded decode error, and verify a transient failure yields `503` rather than `404`
-- [ ] 2.4 Route `writeUpdateFailure` through the new predicates, and verify a transient failure on a mutation yields `503` while a genuinely unknown bill still yields `404`
-- [ ] 2.5 Verify with a live outage that `GET` on an existing open bill returns `503` and not `404`, reproducing the scenario recorded in the proposal
+- [x] 2.1 Replace `isWorkflowGone` in `billing/errors.go` with predicates distinguishing absent, completed, transient, and already-started, and verify task 1.1's test passes without loosening its assertions
+- [x] 2.2 Add the transient rejection reason and its `503` mapping to `reasonStatus` and `reasonTitle`, and verify a `503` response carries `Retry-After` and a machine-readable reason
+- [x] 2.3 Narrow `readBill` so storage is consulted only for an absent or completed execution, propagating every other error including the currently discarded decode error, and verify a transient failure yields `503` rather than `404`
+- [x] 2.4 Route `writeUpdateFailure` through the new predicates, and verify a transient failure on a mutation yields `503` while a genuinely unknown bill still yields `404`
+- [x] 2.5 Verify with a live outage that `GET` on an existing open bill returns `503` and not `404`, reproducing the scenario recorded in the proposal
 
 ## 3. Answer for a bill whose workflow has finished
 

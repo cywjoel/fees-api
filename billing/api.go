@@ -7,6 +7,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"time"
 
@@ -18,6 +19,25 @@ import (
 	"fees-api/internal/billflow"
 	"fees-api/internal/money"
 )
+
+// temporalCallTimeout bounds how long an API request waits on Temporal before
+// answering the caller.
+//
+// Without it the SDK retries a transient failure against the request's own
+// context, which has no deadline, so an outage leaves a mutation hanging rather
+// than refusing it - the caller learns nothing and holds a connection open until
+// it gives up. A bounded wait turns that into a 503 the caller can act on.
+//
+// Timing out is safe here precisely because every mutation is idempotent: an
+// update that did apply before the deadline is recognised as already applied when
+// the caller retries, so a premature 503 cannot double-charge a bill.
+const temporalCallTimeout = 10 * time.Second
+
+// temporalContext bounds a Temporal call to temporalCallTimeout, while still
+// cancelling if the client disconnects first.
+func temporalContext(req *http.Request) (context.Context, context.CancelFunc) {
+	return context.WithTimeout(req.Context(), temporalCallTimeout)
+}
 
 // CreateBillRequest opens a bill for a fee period.
 type CreateBillRequest struct {
@@ -48,7 +68,8 @@ type AddLineItemRequest struct {
 //
 //encore:api public raw method=POST path=/bills
 func (s *Service) CreateBill(w http.ResponseWriter, req *http.Request) {
-	ctx := req.Context()
+	ctx, cancel := temporalContext(req)
+	defer cancel()
 
 	var in CreateBillRequest
 	if err := json.NewDecoder(req.Body).Decode(&in); err != nil {
@@ -75,9 +96,16 @@ func (s *Service) CreateBill(w http.ResponseWriter, req *http.Request) {
 	// second one. This covers the completed case too, where the workflow is gone
 	// and the invoice is read from storage.
 	if keyed {
-		if snap, err := s.readBill(ctx, billID); err == nil {
+		switch snap, readErr := s.readBill(ctx, billID); {
+		case readErr == nil:
 			w.Header().Set("Location", "/bills/"+billID)
 			writeJSON(w, http.StatusOK, snap)
+			return
+		case isWorkflowBusy(readErr):
+			// Whether this key already made a bill is unknowable right now.
+			// Starting one anyway risks a second bill for the same key, so the
+			// honest answer is to ask the caller to retry.
+			writeUnavailable(w, "could not determine whether this idempotency key already created a bill: "+readErr.Error())
 			return
 		}
 	}
@@ -94,13 +122,17 @@ func (s *Service) CreateBill(w http.ResponseWriter, req *http.Request) {
 		PeriodEnd:   in.PeriodEnd,
 	})
 	if err != nil {
-		// The key names a bill that already exists and has finished. Return it.
-		if isWorkflowGone(err) {
+		// The key names a bill that already exists. Return it rather than a second.
+		if isWorkflowAlreadyStarted(err) {
 			if snap, readErr := s.readBill(ctx, billID); readErr == nil {
 				w.Header().Set("Location", "/bills/"+billID)
 				writeJSON(w, http.StatusOK, snap)
 				return
 			}
+		}
+		if isWorkflowBusy(err) {
+			writeUnavailable(w, "the bill could not be started: "+err.Error())
+			return
 		}
 		writeProblem(w, http.StatusInternalServerError, billflow.ReasonInternal,
 			"starting bill workflow: "+err.Error())
@@ -139,7 +171,8 @@ func (s *Service) CreateBill(w http.ResponseWriter, req *http.Request) {
 //
 //encore:api public raw method=PUT path=/bills/:billId/line-items/:itemId
 func (s *Service) AddLineItem(w http.ResponseWriter, req *http.Request) {
-	ctx := req.Context()
+	ctx, cancel := temporalContext(req)
+	defer cancel()
 	billID := pathParam("billId")
 	itemID := pathParam("itemId")
 
@@ -196,7 +229,8 @@ func (s *Service) AddLineItem(w http.ResponseWriter, req *http.Request) {
 //
 //encore:api public raw method=POST path=/bills/:billId/close
 func (s *Service) CloseBill(w http.ResponseWriter, req *http.Request) {
-	ctx := req.Context()
+	ctx, cancel := temporalContext(req)
+	defer cancel()
 	billID := pathParam("billId")
 
 	handle, err := s.temporal.UpdateWorkflow(ctx, client.UpdateWorkflowOptions{
@@ -218,7 +252,11 @@ func (s *Service) CloseBill(w http.ResponseWriter, req *http.Request) {
 
 	// The workflow has already finished, so the bill is closed and its invoice
 	// lives in storage. That still satisfies the request.
-	if isWorkflowGone(err) {
+	if isWorkflowBusy(err) {
+		writeUnavailable(w, "the bill could not be reached to close it: "+err.Error())
+		return
+	}
+	if isWorkflowAbsent(err) {
 		snap, readErr := loadInvoice(ctx, billID)
 		if readErr == nil {
 			w.Header().Set("Location", "/bills/"+billID)
@@ -243,13 +281,23 @@ func (s *Service) CloseBill(w http.ResponseWriter, req *http.Request) {
 //
 //encore:api public raw method=GET path=/bills/:billId
 func (s *Service) GetBill(w http.ResponseWriter, req *http.Request) {
-	snap, err := s.readBill(req.Context(), pathParam("billId"))
+	billID := pathParam("billId")
+
+	ctx, cancel := temporalContext(req)
+	defer cancel()
+
+	snap, err := s.readBill(ctx, billID)
 	if err != nil {
-		if errors.Is(err, ErrInvoiceNotFound) {
-			writeNotFound(w, pathParam("billId"))
-			return
+		switch {
+		case errors.Is(err, ErrInvoiceNotFound):
+			// Both sources were asked and neither had the bill. This is the only
+			// circumstance in which "not found" is true.
+			writeNotFound(w, billID)
+		case isWorkflowBusy(err):
+			writeUnavailable(w, "the bill's state could not be read: "+err.Error())
+		default:
+			writeProblem(w, http.StatusInternalServerError, billflow.ReasonInternal, err.Error())
 		}
-		writeProblem(w, http.StatusInternalServerError, billflow.ReasonInternal, err.Error())
 		return
 	}
 	writeJSON(w, http.StatusOK, snap)
@@ -259,23 +307,44 @@ func (s *Service) GetBill(w http.ResponseWriter, req *http.Request) {
 // workflow first, then durable storage.
 func (s *Service) readBill(ctx context.Context, billID string) (bill.Snapshot, error) {
 	ev, err := s.temporal.QueryWorkflow(ctx, billID, "", billflow.QueryGetBill)
-	if err == nil {
+	switch {
+	case err == nil:
 		var snap bill.Snapshot
-		if decodeErr := ev.Get(&snap); decodeErr == nil {
-			return snap, nil
+		if decodeErr := ev.Get(&snap); decodeErr != nil {
+			// Previously discarded, which turned a malformed answer into a missing
+			// bill. A workflow that answers unintelligibly is a fault, not an absence.
+			return bill.Snapshot{}, fmt.Errorf("billing: decoding bill %q from its workflow: %w", billID, decodeErr)
 		}
+		return snap, nil
+
+	case isWorkflowAbsent(err):
+		// The only condition under which storage is the right place to look: there
+		// is no live execution to ask, so the persisted invoice is all there is.
+		return loadInvoice(ctx, billID)
+
+	default:
+		// Everything else - unreachable, busy, overloaded, or an outright fault -
+		// propagates. Falling back here is what made a Temporal outage look like
+		// every open bill having been deleted.
+		return bill.Snapshot{}, fmt.Errorf("billing: querying bill %q: %w", billID, err)
 	}
-	return loadInvoice(ctx, billID)
 }
 
 // writeUpdateFailure reports an update that did not apply. A workflow that no
 // longer exists is a missing bill, not an internal fault.
 func (s *Service) writeUpdateFailure(w http.ResponseWriter, billID string, err error) {
-	if isWorkflowGone(err) {
+	switch {
+	case isWorkflowBusy(err):
+		writeUnavailable(w, "the bill could not be reached: "+err.Error())
+	case isWorkflowAbsent(err):
+		// TODO(group 3): a completed workflow reaches here too, and its bill may
+		// well exist in storage. Answering 404 for a bill that GET returns 200 for
+		// is the defect e2e's "409 once the bill is no longer open" case pins;
+		// task 3.3 gives this path the storage fallback CloseBill already has.
 		writeNotFound(w, billID)
-		return
+	default:
+		writeRejection(w, err)
 	}
-	writeRejection(w, err)
 }
 
 // pathParam reads a path parameter from the in-flight Encore request.
