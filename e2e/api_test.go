@@ -315,9 +315,21 @@ func TestAddLineItemStatusMatrix(t *testing.T) {
 		if r := do(t, http.MethodPost, "/bills/"+billID+"/close", nil, nil); r.status != http.StatusAccepted {
 			t.Fatalf("close = %d, want 202", r.status)
 		}
+
+		// Wait for CLOSED before offering the late charge.
+		//
+		// Without this the request lands in the brief CLOSING window, where the
+		// workflow is still running and its validator answers the update - the one
+		// state in which the rejection is correct. Every real client meets the bill
+		// after its workflow has completed, and this test must meet it there too.
+		waitForState(t, billID, "CLOSED", 30*time.Second)
+
 		got := addItem(t, billID, "txn_late", 700, "USD", "late fee")
 		if got.status != http.StatusConflict {
-			t.Fatalf("status = %d, want 409 (%s)", got.status, got.raw)
+			t.Fatalf("status = %d, want 409 (%s)\n\n"+
+				"A 404 here means the bill's completed workflow was read as the bill not "+
+				"existing. GET on this same id answers 200 with the invoice, so the charge "+
+				"is being refused as unknown rather than as too late.", got.status, got.raw)
 		}
 		if got.reason() != "bill_not_open" {
 			t.Errorf("reason = %q, want bill_not_open", got.reason())
