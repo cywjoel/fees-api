@@ -72,19 +72,35 @@ func (r response) totalMinorUnits(t *testing.T) int64 {
 
 func do(t *testing.T, method, path string, body any, headers map[string]string) response {
 	t.Helper()
+	r, err := request(method, path, body, headers)
+	if err != nil {
+		t.Fatalf("%s %s: %v", method, path, err)
+	}
+	return r
+}
 
+// request performs a call and returns a transport failure rather than ending the
+// test.
+//
+// A goroutine must use this, never do(). t.Fatalf stops a test by killing the
+// goroutine it runs on, which is right from the test goroutine and wrong from a
+// spawned one: there it ends that goroutine quietly, the waitgroup still
+// completes, and the test carries on to report a missing result as though the
+// assertion had failed. A refused connection then reads as a lost write, and
+// whoever investigates goes looking for a concurrency defect that is not there.
+func request(method, path string, body any, headers map[string]string) (response, error) {
 	var reader io.Reader
 	if body != nil {
 		b, err := json.Marshal(body)
 		if err != nil {
-			t.Fatalf("encoding request: %v", err)
+			return response{}, fmt.Errorf("encoding request: %w", err)
 		}
 		reader = bytes.NewReader(b)
 	}
 
 	req, err := http.NewRequest(method, baseURL+path, reader)
 	if err != nil {
-		t.Fatalf("building request: %v", err)
+		return response{}, fmt.Errorf("building request: %w", err)
 	}
 	req.Header.Set("Content-Type", "application/json")
 	for k, v := range headers {
@@ -93,14 +109,14 @@ func do(t *testing.T, method, path string, body any, headers map[string]string) 
 
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
-		t.Fatalf("%s %s: %v", method, path, err)
+		return response{}, err
 	}
 	defer resp.Body.Close()
 
 	raw, _ := io.ReadAll(resp.Body)
 	out := response{status: resp.StatusCode, headers: resp.Header, raw: raw}
 	_ = json.Unmarshal(raw, &out.body)
-	return out
+	return out, nil
 }
 
 // createBill opens a bill whose period runs for the given duration.
@@ -128,10 +144,18 @@ func createBillBody(currency string, period time.Duration) map[string]any {
 
 func addItem(t *testing.T, billID, itemID string, minorUnits int64, currency, desc string) response {
 	t.Helper()
-	return do(t, http.MethodPut, "/bills/"+billID+"/line-items/"+itemID, map[string]any{
+	return do(t, http.MethodPut, lineItemPath(billID, itemID), lineItemBody(minorUnits, currency, desc), nil)
+}
+
+func lineItemPath(billID, itemID string) string {
+	return "/bills/" + billID + "/line-items/" + itemID
+}
+
+func lineItemBody(minorUnits int64, currency, desc string) map[string]any {
+	return map[string]any{
 		"amount":      map[string]any{"minorUnits": minorUnits, "currency": currency},
 		"description": desc,
-	}, nil)
+	}
 }
 
 func billIDOf(t *testing.T, r response) string {
@@ -208,18 +232,32 @@ func TestConcurrentCreationsSharingAKeyReportOneCreation(t *testing.T) {
 		wg      sync.WaitGroup
 		mu      sync.Mutex
 		results = make([]response, 0, attempts)
+		errs    []error
 	)
 	for i := 0; i < attempts; i++ {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			r := do(t, http.MethodPost, "/bills", body, headers)
+			r, err := request(http.MethodPost, "/bills", body, headers)
 			mu.Lock()
+			defer mu.Unlock()
+			if err != nil {
+				errs = append(errs, err)
+				return
+			}
 			results = append(results, r)
-			mu.Unlock()
 		}()
 	}
 	wg.Wait()
+
+	// Reported here, on the test goroutine, so a refused connection is named as
+	// one instead of surfacing as a missing result below.
+	for _, err := range errs {
+		t.Errorf("request failed: %v", err)
+	}
+	if len(errs) > 0 {
+		t.Fatalf("%d of %d requests did not complete; the counts below would be misleading", len(errs), attempts)
+	}
 
 	created, existing, ids := 0, 0, map[string]bool{}
 	for _, r := range results {
@@ -574,6 +612,7 @@ func TestConcurrentLineItemsAreAllRetained(t *testing.T) {
 		wg       sync.WaitGroup
 		mu       sync.Mutex
 		statuses = map[int]int{}
+		errs     []error
 		wantSum  int64
 	)
 	for i := 0; i < items; i++ {
@@ -582,13 +621,30 @@ func TestConcurrentLineItemsAreAllRetained(t *testing.T) {
 		wg.Add(1)
 		go func(i int, amount int64) {
 			defer wg.Done()
-			r := addItem(t, billID, fmt.Sprintf("txn_%02d", i), amount, "USD", "concurrent fee")
+			r, err := request(http.MethodPut,
+				lineItemPath(billID, fmt.Sprintf("txn_%02d", i)),
+				lineItemBody(amount, "USD", "concurrent fee"), nil)
 			mu.Lock()
+			defer mu.Unlock()
+			if err != nil {
+				errs = append(errs, err)
+				return
+			}
 			statuses[r.status]++
-			mu.Unlock()
 		}(i, amount)
 	}
 	wg.Wait()
+
+	// A request that never completed is an infrastructure failure, not a lost
+	// write. Saying so here stops the assertions below blaming the workflow for
+	// a charge that was never delivered to it.
+	for _, err := range errs {
+		t.Errorf("request failed: %v", err)
+	}
+	if len(errs) > 0 {
+		t.Fatalf("%d of %d additions did not reach the API; the totals below would "+
+			"report a lost write where the charge was never sent", len(errs), items)
+	}
 
 	if got := statuses[http.StatusCreated]; got != items {
 		t.Errorf("%d additions reported 201, want %d (all statuses: %v)", got, items, statuses)

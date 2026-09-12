@@ -251,14 +251,21 @@ func BillWorkflow(ctx workflow.Context, in StartBillInput) (bill.Snapshot, error
 	}
 	periodTimer := workflow.NewTimer(ctx, untilPeriodEnd)
 
+	// A failure to close at period end cannot be swallowed here. The timer has
+	// already fired and there is no second one, so the Await below would block
+	// forever: the bill would sit OPEN past the end of its period, still taking
+	// charges, never invoiced and never persisted. It is carried out of the
+	// callback and fails the workflow instead, which is visible and alertable
+	// where an eternal wait is neither.
+	var periodEndCloseErr error
+
 	selector := workflow.NewSelector(ctx)
 	selector.AddFuture(periodTimer, func(workflow.Future) {
 		// Guarded, because an early close may already have won this race.
 		if b.State() == bill.StateOpen {
 			if _, closeErr := beginClose(bill.TriggerPeriodEnd); closeErr != nil {
-				// The main loop's Await below keeps waiting, and the bill stays
-				// visibly OPEN rather than being reported as something it is not.
 				logger.Error("period-end close failed", "billID", b.ID(), "error", closeErr)
+				periodEndCloseErr = closeErr
 			}
 		}
 	})
@@ -267,6 +274,11 @@ func BillWorkflow(ctx workflow.Context, in StartBillInput) (bill.Snapshot, error
 		// end the wait.
 	})
 	selector.Select(ctx)
+
+	if periodEndCloseErr != nil {
+		return bill.Snapshot{}, temporal.NewNonRetryableApplicationError(
+			periodEndCloseErr.Error(), ClassifyRejection(periodEndCloseErr), periodEndCloseErr)
+	}
 
 	// Belt and braces: the selector woke us, but the bill is only genuinely
 	// closed once its state says so.
