@@ -521,3 +521,140 @@ func TestSnapshotOmitsClosureDetailWhileOpen(t *testing.T) {
 		t.Errorf("closedBy = %q, want empty while open", snap.ClosedBy)
 	}
 }
+
+// --- 3.1, 3.2 --------------------------------------------------------------
+
+// closedSnapshotWith builds the invoice a finished bill leaves behind.
+func closedSnapshotWith(t *testing.T, items ...bill.LineItem) bill.Snapshot {
+	t.Helper()
+	closedAt := time.Date(2026, 9, 12, 10, 0, 0, 0, time.UTC)
+	total := money.Zero(usd)
+	for _, it := range items {
+		sum, err := total.Add(it.Amount)
+		if err != nil {
+			t.Fatalf("building snapshot total: %v", err)
+		}
+		total = sum
+	}
+	return bill.Snapshot{
+		ID:        "bill_closed",
+		State:     bill.StateClosed,
+		Currency:  usd,
+		Total:     total,
+		LineItems: items,
+		ClosedAt:  &closedAt,
+		ClosedBy:  bill.TriggerAPIRequest,
+	}
+}
+
+func invoicedItem(id string, minor int64, desc string) bill.LineItem {
+	return bill.LineItem{
+		ID:          id,
+		Amount:      money.New(minor, usd),
+		Description: desc,
+		AccruedAt:   time.Date(2026, 9, 12, 9, 0, 0, 0, time.UTC),
+	}
+}
+
+// A bill whose workflow has finished still has to answer for charges, and the
+// answer depends on whether the charge is already on its invoice.
+func TestCheckAgainstSnapshot(t *testing.T) {
+	invoice := closedSnapshotWith(t, invoicedItem("txn_a", 500, "wire fee"))
+
+	t.Run("identical retry returns the accrued item", func(t *testing.T) {
+		got, err := bill.CheckAgainstSnapshot(invoice, invoicedItem("txn_a", 500, "wire fee"))
+		if err != nil {
+			t.Fatalf("returned error: %v", err)
+		}
+		if got == nil {
+			t.Fatal("returned no item; a charge already on the invoice must be reported as present")
+		}
+		if got.Amount.MinorUnits() != 500 {
+			t.Errorf("amount = %d, want the stored 500", got.Amount.MinorUnits())
+		}
+	})
+
+	t.Run("same id with a different amount conflicts", func(t *testing.T) {
+		_, err := bill.CheckAgainstSnapshot(invoice, invoicedItem("txn_a", 900, "wire fee"))
+		if !errors.Is(err, bill.ErrLineItemConflict) {
+			t.Fatalf("error = %v, want ErrLineItemConflict", err)
+		}
+	})
+
+	t.Run("same id with a different description conflicts", func(t *testing.T) {
+		_, err := bill.CheckAgainstSnapshot(invoice, invoicedItem("txn_a", 500, "late fee"))
+		if !errors.Is(err, bill.ErrLineItemConflict) {
+			t.Fatalf("error = %v, want ErrLineItemConflict", err)
+		}
+	})
+
+	t.Run("a charge absent from the invoice arrived too late", func(t *testing.T) {
+		_, err := bill.CheckAgainstSnapshot(invoice, invoicedItem("txn_new", 700, "late fee"))
+		if !errors.Is(err, bill.ErrNotOpen) {
+			t.Fatalf("error = %v, want ErrNotOpen", err)
+		}
+	})
+
+	t.Run("missing detail is refused the same way the live path refuses it", func(t *testing.T) {
+		_, err := bill.CheckAgainstSnapshot(invoice, bill.LineItem{ID: "txn_x", Description: "no amount"})
+		if !errors.Is(err, bill.ErrInvalidLineItem) {
+			t.Fatalf("error = %v, want ErrInvalidLineItem", err)
+		}
+	})
+}
+
+// 3.2 A retry carries a later accrual time than the item it repeats, because the
+// clock moved between the two attempts. Comparing that field would turn every
+// retry into a conflict - reporting a charge as contradictory when it is the
+// same charge arriving twice.
+func TestCheckAgainstSnapshotIgnoresAccrualTime(t *testing.T) {
+	invoice := closedSnapshotWith(t, invoicedItem("txn_a", 500, "wire fee"))
+
+	retry := invoicedItem("txn_a", 500, "wire fee")
+	retry.AccruedAt = retry.AccruedAt.Add(90 * time.Second)
+
+	got, err := bill.CheckAgainstSnapshot(invoice, retry)
+	if err != nil {
+		t.Fatalf("a retry 90s later was refused: %v", err)
+	}
+	if !got.AccruedAt.Equal(time.Date(2026, 9, 12, 9, 0, 0, 0, time.UTC)) {
+		t.Errorf("AccruedAt = %s, want the time the charge was first accrued", got.AccruedAt)
+	}
+}
+
+// The storage path and the live path must agree, or a bill would answer
+// differently depending on whether its workflow happened to still be running.
+func TestCheckAgainstSnapshotAgreesWithTheLivePath(t *testing.T) {
+	b := newOpenBill(t)
+	accrued := invoicedItem("txn_a", 500, "wire fee")
+	if _, err := b.AddLineItem(accrued); err != nil {
+		t.Fatalf("accruing: %v", err)
+	}
+	if _, err := b.Close(bill.TriggerAPIRequest, time.Now()); err != nil {
+		t.Fatalf("closing: %v", err)
+	}
+	snap := b.Snapshot()
+
+	for _, tc := range []struct {
+		name string
+		item bill.LineItem
+	}{
+		{"identical retry", invoicedItem("txn_a", 500, "wire fee")},
+		{"conflicting reuse", invoicedItem("txn_a", 900, "wire fee")},
+		{"a new charge", invoicedItem("txn_b", 100, "late fee")},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			_, liveErr := b.AddLineItem(tc.item)
+			_, snapErr := bill.CheckAgainstSnapshot(snap, tc.item)
+
+			switch {
+			case liveErr == nil && snapErr == nil:
+			case liveErr == nil || snapErr == nil:
+				t.Fatalf("live path returned %v but storage path returned %v", liveErr, snapErr)
+			case errors.Is(liveErr, bill.ErrLineItemConflict) != errors.Is(snapErr, bill.ErrLineItemConflict),
+				errors.Is(liveErr, bill.ErrNotOpen) != errors.Is(snapErr, bill.ErrNotOpen):
+				t.Fatalf("live path returned %v but storage path returned %v", liveErr, snapErr)
+			}
+		})
+	}
+}

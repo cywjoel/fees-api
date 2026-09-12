@@ -167,17 +167,27 @@ func (b *Bill) ValidateLineItem(item LineItem) error {
 	return err
 }
 
+// validateLineItem reports whether an item carries the detail every charge must
+// have, independent of any bill. Shared by the live path and the storage path so
+// a malformed item is refused the same way whichever answers it.
+func validateLineItem(item LineItem) error {
+	if item.ID == "" {
+		return fmt.Errorf("%w: id is required", ErrInvalidLineItem)
+	}
+	if item.Amount.Currency().IsZero() {
+		return fmt.Errorf("%w: amount and currency are required", ErrInvalidLineItem)
+	}
+	if item.Description == "" {
+		return fmt.Errorf("%w: description is required", ErrInvalidLineItem)
+	}
+	return nil
+}
+
 // checkLineItem applies every acceptance rule without mutating the bill. It
 // returns the already-accrued item when the addition is an idempotent retry.
 func (b *Bill) checkLineItem(item LineItem) (*LineItem, error) {
-	if item.ID == "" {
-		return nil, fmt.Errorf("%w: id is required", ErrInvalidLineItem)
-	}
-	if item.Amount.Currency().IsZero() {
-		return nil, fmt.Errorf("%w: amount and currency are required", ErrInvalidLineItem)
-	}
-	if item.Description == "" {
-		return nil, fmt.Errorf("%w: description is required", ErrInvalidLineItem)
+	if err := validateLineItem(item); err != nil {
+		return nil, err
 	}
 
 	// Deduplication precedes the state check. An identical retry of an item that
@@ -200,6 +210,40 @@ func (b *Bill) checkLineItem(item LineItem) (*LineItem, error) {
 			money.ErrCurrencyMismatch, b.id, b.currency.Code, item.Amount.Currency().Code)
 	}
 	return nil, nil
+}
+
+// CheckAgainstSnapshot applies the acceptance rules to a line item offered to a
+// bill that is no longer live, using the frozen invoice as the only evidence.
+//
+// It exists because a bill whose workflow has finished still has to answer for
+// charges. The invoice is read back from storage as a Snapshot rather than a
+// Bill, so AddLineItem cannot be used, and the obvious alternative - comparing
+// the item against the snapshot at the call site - would state the deduplication
+// rule a second time, in a second place, where the two would drift.
+//
+// It returns the already-accrued item when the addition is an identical retry,
+// ErrLineItemConflict when the identifier was reused with different detail, and
+// ErrNotOpen when the charge is genuinely new and has arrived too late.
+func CheckAgainstSnapshot(snap Snapshot, item LineItem) (*LineItem, error) {
+	if err := validateLineItem(item); err != nil {
+		return nil, err
+	}
+	for _, existing := range snap.LineItems {
+		if existing.ID != item.ID {
+			continue
+		}
+		if !existing.sameChargeAs(item) {
+			return nil, fmt.Errorf("%w: %q", ErrLineItemConflict, item.ID)
+		}
+		return &existing, nil
+	}
+	if AcceptsLineItems(snap.State) {
+		// A live bill's charges are the workflow's to answer for, not storage's.
+		// Reaching here would mean reading a stale invoice for an open bill.
+		return nil, fmt.Errorf("%w: %q is in %s and should be answered by its workflow",
+			ErrNotOpen, snap.ID, snap.State)
+	}
+	return nil, fmt.Errorf("%w: %q is in %s", ErrNotOpen, snap.ID, snap.State)
 }
 
 // AddLineItem accrues a charge onto an open bill.

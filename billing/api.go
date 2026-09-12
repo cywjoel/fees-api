@@ -194,13 +194,13 @@ func (s *Service) AddLineItem(w http.ResponseWriter, req *http.Request) {
 		}},
 	})
 	if err != nil {
-		s.writeUpdateFailure(w, billID, err)
+		s.writeAddFailure(w, ctx, billID, itemID, in, err)
 		return
 	}
 
 	var result bill.AddResult
 	if err := handle.Get(ctx, &result); err != nil {
-		s.writeUpdateFailure(w, billID, err)
+		s.writeAddFailure(w, ctx, billID, itemID, in, err)
 		return
 	}
 
@@ -258,15 +258,20 @@ func (s *Service) CloseBill(w http.ResponseWriter, req *http.Request) {
 	}
 	if isWorkflowAbsent(err) {
 		snap, readErr := loadInvoice(ctx, billID)
-		if readErr == nil {
+		switch {
+		case readErr == nil:
 			w.Header().Set("Location", "/bills/"+billID)
 			writeJSON(w, http.StatusAccepted, snap)
-			return
-		}
-		if errors.Is(readErr, ErrInvoiceNotFound) {
+		case errors.Is(readErr, ErrInvoiceNotFound):
+			// Neither source has the bill, so it really is absent.
 			writeNotFound(w, billID)
-			return
+		default:
+			// Storage failed. Falling through here reported a database outage as a
+			// missing bill, which reads as "this never existed" and pages nobody.
+			writeProblem(w, http.StatusInternalServerError, billflow.ReasonInternal,
+				"reading the invoice for bill "+billID+": "+readErr.Error())
 		}
+		return
 	}
 	s.writeUpdateFailure(w, billID, err)
 }
@@ -330,21 +335,74 @@ func (s *Service) readBill(ctx context.Context, billID string) (bill.Snapshot, e
 	}
 }
 
-// writeUpdateFailure reports an update that did not apply. A workflow that no
-// longer exists is a missing bill, not an internal fault.
+// writeUpdateFailure reports an update that did not apply.
 func (s *Service) writeUpdateFailure(w http.ResponseWriter, billID string, err error) {
 	switch {
 	case isWorkflowBusy(err):
 		writeUnavailable(w, "the bill could not be reached: "+err.Error())
 	case isWorkflowAbsent(err):
-		// TODO(group 3): a completed workflow reaches here too, and its bill may
-		// well exist in storage. Answering 404 for a bill that GET returns 200 for
-		// is the defect e2e's "409 once the bill is no longer open" case pins;
-		// task 3.3 gives this path the storage fallback CloseBill already has.
 		writeNotFound(w, billID)
 	default:
 		writeRejection(w, err)
 	}
+}
+
+// writeAddFailure answers a charge the workflow could not take.
+//
+// A bill's workflow finishes within seconds of the bill closing, and stays
+// finished for the rest of the bill's life - so "no live execution" is the
+// ordinary condition of a closed bill, not an exotic one. Treating it as a
+// missing bill answered 404 for a charge on a bill that GET returns 200 for, and
+// a caller told its charge was refused as unknown may compensate for money that
+// is genuinely on the invoice.
+//
+// So the persisted invoice is consulted, exactly as CloseBill already does, and
+// the answer comes from the same domain rule the live path applies.
+func (s *Service) writeAddFailure(w http.ResponseWriter, ctx context.Context, billID, itemID string, in AddLineItemRequest, err error) {
+	if !isWorkflowAbsent(err) {
+		s.writeUpdateFailure(w, billID, err)
+		return
+	}
+
+	snap, loadErr := loadInvoice(ctx, billID)
+	if loadErr != nil {
+		if errors.Is(loadErr, ErrInvoiceNotFound) {
+			// Neither the workflow nor storage has this bill. Now 404 is true.
+			writeNotFound(w, billID)
+			return
+		}
+		writeProblem(w, http.StatusInternalServerError, billflow.ReasonInternal,
+			"reading the invoice for bill "+billID+": "+loadErr.Error())
+		return
+	}
+
+	existing, checkErr := bill.CheckAgainstSnapshot(snap, bill.LineItem{
+		ID:          itemID,
+		Amount:      in.Amount,
+		Description: in.Description,
+	})
+	if checkErr != nil {
+		writeProblem(w, statusForDomainError(checkErr), billflow.ClassifyRejection(checkErr), checkErr.Error())
+		return
+	}
+
+	// The charge is already on the invoice, so the retry succeeded the first time.
+	w.Header().Set("Location", "/bills/"+billID+"/line-items/"+itemID)
+	writeJSON(w, http.StatusOK, bill.AddResult{
+		Outcome:      bill.OutcomeAlreadyAccrued,
+		LineItem:     *existing,
+		RunningTotal: snap.Total,
+	})
+}
+
+// statusForDomainError maps a domain error to its status using the same table
+// the workflow's rejections go through, so a charge refused from storage and the
+// same charge refused by the workflow answer identically.
+func statusForDomainError(err error) int {
+	if status, ok := reasonStatus[billflow.ClassifyRejection(err)]; ok {
+		return status
+	}
+	return http.StatusInternalServerError
 }
 
 // pathParam reads a path parameter from the in-flight Encore request.

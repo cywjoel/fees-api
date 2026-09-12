@@ -17,11 +17,11 @@
 
 ## 3. Answer for a bill whose workflow has finished
 
-- [ ] 3.1 Add `bill.CheckAgainstSnapshot` to `internal/bill`, reusing the comparison `checkLineItem` uses so the deduplication rule is stated once, and verify unit tests cover identical retry, conflicting reuse, and an item absent from the invoice
-- [ ] 3.2 Verify `CheckAgainstSnapshot` ignores `AccruedAt`, so a retry carrying a later timestamp is not mistaken for a conflicting charge
-- [ ] 3.3 Give `AddLineItem` the storage fallback when the workflow is absent or completed, answering `409 bill_not_open` for a new charge, `409 line_item_conflict` for a reused id with different detail, and `200` for an identical retry, and verify task 1.2's e2e case passes
-- [ ] 3.4 Verify by reproduction that `GET`, `PUT` and `POST /close` now agree about whether a closed bill exists, replacing the three-way disagreement recorded in the proposal
-- [ ] 3.5 Fix the `CloseBill` fallback so a non-`ErrInvoiceNotFound` storage error reports a server fault rather than falling through to `404`, and verify with an induced storage error
+- [x] 3.1 Add `bill.CheckAgainstSnapshot` to `internal/bill`, reusing the comparison `checkLineItem` uses so the deduplication rule is stated once, and verify unit tests cover identical retry, conflicting reuse, and an item absent from the invoice
+- [x] 3.2 Verify `CheckAgainstSnapshot` ignores `AccruedAt`, so a retry carrying a later timestamp is not mistaken for a conflicting charge
+- [x] 3.3 Give `AddLineItem` the storage fallback when the workflow is absent or completed, answering `409 bill_not_open` for a new charge, `409 line_item_conflict` for a reused id with different detail, and `200` for an identical retry, and verify task 1.2's e2e case passes
+- [x] 3.4 Verify by reproduction that `GET`, `PUT` and `POST /close` now agree about whether a closed bill exists, replacing the three-way disagreement recorded in the proposal
+- [x] 3.5 Fix the `CloseBill` fallback so a non-`ErrInvoiceNotFound` storage error reports a server fault rather than falling through to `404`, and verify with an induced storage error
 
 ## 4. Creation idempotency
 
