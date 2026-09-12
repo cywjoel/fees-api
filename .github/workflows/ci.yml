@@ -1,0 +1,69 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  # Domain, workflow, and replay tests. These need no infrastructure: the fee
+  # period is skipped in the Temporal test environment and the replay fixtures are
+  # committed JSON, so the whole suite runs in seconds.
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.26'
+          cache: true
+
+      - name: Verify formatting
+        run: |
+          unformatted="$(gofmt -l .)"
+          if [ -n "$unformatted" ]; then
+            echo "These files are not gofmt'd:"
+            echo "$unformatted"
+            exit 1
+          fi
+
+      - name: Vet
+        run: go vet ./...
+
+      - name: Build
+        run: go build ./...
+
+      # The determinism guard, called out separately because its failure means
+      # something specific: the workflow's command sequence changed, and any bill
+      # still inside its fee period would fail to resume after a deploy. The fix
+      # is to restore the previous sequence or to gate the change behind
+      # workflow.GetVersion - never to re-record the fixtures to make it pass.
+      - name: Replay committed workflow histories
+        run: go test ./internal/billflow/ -run 'TestReplayCommittedHistories|TestFixturesCoverTheWorkflowsBehaviour' -v
+
+      # ./billing is deliberately absent: it declares an Encore database, and
+      # sqldb.NewDatabase panics outside the Encore runtime, so that package is
+      # covered by the encore-test job below rather than here.
+      - name: Unit and workflow tests
+        run: go test ./internal/... ./e2e/ -race
+
+  # The database tests need Encore, which provisions a local Postgres in Docker.
+  encore-test:
+    name: Encore test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.26'
+          cache: true
+
+      - name: Install Encore
+        run: |
+          curl -L https://encore.dev/install.sh | bash
+          echo "$HOME/.encore/bin" >> "$GITHUB_PATH"
+
+      - name: Run Encore tests
+        run: encore test ./...

@@ -1,0 +1,305 @@
+package bill
+
+import (
+	"errors"
+	"fmt"
+	"time"
+
+	"fees-api/internal/money"
+)
+
+var (
+	// ErrNotOpen is returned when a line item is offered to a bill whose totals
+	// are already frozen. It is the state-integrity rejection: a contradiction
+	// between what the caller wants and what the bill now is.
+	ErrNotOpen = errors.New("bill: bill is not open")
+
+	// ErrLineItemConflict is returned when a line item identifier already
+	// present on the bill is reused with different detail. That is not a retry
+	// - it is two different charges claiming one identity - so it is rejected
+	// rather than resolved by overwriting.
+	ErrLineItemConflict = errors.New("bill: line item id already used with different detail")
+
+	// ErrInvalidLineItem is returned when a line item is missing required detail.
+	ErrInvalidLineItem = errors.New("bill: line item is missing required detail")
+
+	// ErrInvalidPeriod is returned when a fee period does not end after it begins.
+	ErrInvalidPeriod = errors.New("bill: period end must be after period start")
+
+	// ErrInvalidBill is returned when a bill is missing required detail.
+	ErrInvalidBill = errors.New("bill: bill is missing required detail")
+)
+
+// LineItem is a single fee accrued onto a bill.
+//
+// The identifier is supplied by the caller, not generated here. A fee is caused
+// by something that already has an identity - a transaction, a transfer, a card
+// authorisation - so keying the item by that identity makes deduplication a
+// business invariant rather than a transport trick: the fee for a given source
+// event appears at most once on a bill.
+type LineItem struct {
+	ID          string      `json:"id"`
+	Amount      money.Money `json:"amount"`
+	Description string      `json:"description"`
+	AccruedAt   time.Time   `json:"accruedAt"`
+}
+
+// sameChargeAs reports whether other states the same charge as l.
+//
+// AccruedAt is deliberately excluded. A retry of an addition carries a later
+// timestamp than the original, and that difference must not be mistaken for a
+// conflicting charge; the stored item keeps the time it was first accrued.
+func (l LineItem) sameChargeAs(other LineItem) bool {
+	return l.Amount.Equal(other.Amount) && l.Description == other.Description
+}
+
+// Outcome reports whether an addition created a new line item or matched one
+// already accrued, so the API layer can answer 201 or 200 accordingly.
+type Outcome string
+
+const (
+	// OutcomeCreated means the line item was newly accrued.
+	OutcomeCreated Outcome = "created"
+
+	// OutcomeAlreadyAccrued means an identical line item was already present, so
+	// the addition was a retry and changed nothing.
+	OutcomeAlreadyAccrued Outcome = "already_accrued"
+)
+
+// AddResult is the outcome of accruing a line item.
+type AddResult struct {
+	Outcome      Outcome     `json:"outcome"`
+	LineItem     LineItem    `json:"lineItem"`
+	RunningTotal money.Money `json:"runningTotal"`
+}
+
+// Snapshot is a bill's externally visible state at a point in time. For a closed
+// bill it is the invoice: the total charged and every line item comprising it.
+type Snapshot struct {
+	ID          string         `json:"id"`
+	State       State          `json:"state"`
+	Currency    money.Currency `json:"currency"`
+	PeriodStart time.Time      `json:"periodStart"`
+	PeriodEnd   time.Time      `json:"periodEnd"`
+	CreatedAt   time.Time      `json:"createdAt"`
+	Total       money.Money    `json:"total"`
+	LineItems   []LineItem     `json:"lineItems"`
+	ClosedAt    *time.Time     `json:"closedAt,omitempty"`
+	ClosedBy    Trigger        `json:"closedBy,omitempty"`
+}
+
+// Bill is the aggregate: a fee period, the charges accrued against it, and the
+// lifecycle position that decides what may still happen to it.
+//
+// It is not safe for concurrent use, and deliberately so. Serialisation is the
+// workflow's job - a bill is mutated only from a single workflow goroutine - so
+// carrying a mutex here would suggest a concurrency model the design does not
+// have.
+type Bill struct {
+	id          string
+	currency    money.Currency
+	periodStart time.Time
+	periodEnd   time.Time
+	createdAt   time.Time
+
+	state State
+	total money.Money
+
+	items map[string]LineItem
+	// order preserves insertion order for listing. Go randomises map iteration,
+	// which would make the reported line item order vary between runs; inside a
+	// workflow that non-determinism would break history replay outright.
+	order []string
+
+	closedAt time.Time
+	closedBy Trigger
+}
+
+// New opens a bill for a fee period.
+func New(id string, currency money.Currency, periodStart, periodEnd, createdAt time.Time) (*Bill, error) {
+	if id == "" {
+		return nil, fmt.Errorf("%w: id is required", ErrInvalidBill)
+	}
+	if currency.IsZero() {
+		return nil, fmt.Errorf("%w: currency is required", ErrInvalidBill)
+	}
+	if !periodEnd.After(periodStart) {
+		return nil, fmt.Errorf("%w: %s is not after %s",
+			ErrInvalidPeriod, periodEnd.Format(time.RFC3339), periodStart.Format(time.RFC3339))
+	}
+	return &Bill{
+		id:          id,
+		currency:    currency,
+		periodStart: periodStart,
+		periodEnd:   periodEnd,
+		createdAt:   createdAt,
+		state:       StateOpen,
+		total:       money.Zero(currency),
+		items:       make(map[string]LineItem),
+	}, nil
+}
+
+// ID returns the bill's identifier.
+func (b *Bill) ID() string { return b.id }
+
+// State returns the bill's current lifecycle state.
+func (b *Bill) State() State { return b.state }
+
+// Currency returns the currency the bill is denominated in.
+func (b *Bill) Currency() money.Currency { return b.currency }
+
+// PeriodEnd returns the instant the fee period closes.
+func (b *Bill) PeriodEnd() time.Time { return b.periodEnd }
+
+// Total returns the running total of an open bill, or the frozen total of one
+// that has closed.
+func (b *Bill) Total() money.Money { return b.total }
+
+// ValidateLineItem reports the error that AddLineItem would return for item,
+// or nil if the addition would be accepted, without mutating the bill.
+//
+// It exists so that a Temporal update validator can reject an addition before it
+// enters workflow history. A rejected update is never recorded; an update that
+// fails inside its handler is. Validating first is therefore both the correct
+// semantics - the caller gets a synchronous refusal - and the cheaper one.
+func (b *Bill) ValidateLineItem(item LineItem) error {
+	_, err := b.checkLineItem(item)
+	return err
+}
+
+// checkLineItem applies every acceptance rule without mutating the bill. It
+// returns the already-accrued item when the addition is an idempotent retry.
+func (b *Bill) checkLineItem(item LineItem) (*LineItem, error) {
+	if item.ID == "" {
+		return nil, fmt.Errorf("%w: id is required", ErrInvalidLineItem)
+	}
+	if item.Amount.Currency().IsZero() {
+		return nil, fmt.Errorf("%w: amount and currency are required", ErrInvalidLineItem)
+	}
+	if item.Description == "" {
+		return nil, fmt.Errorf("%w: description is required", ErrInvalidLineItem)
+	}
+
+	// Deduplication precedes the state check. An identical retry of an item that
+	// was already accrued while the bill was open describes a charge the bill
+	// already carries; answering "conflict" because the bill has since closed
+	// would report a failure for something that in fact succeeded, and invite the
+	// caller to compensate for money that is genuinely on the invoice.
+	if existing, ok := b.items[item.ID]; ok {
+		if !existing.sameChargeAs(item) {
+			return nil, fmt.Errorf("%w: %q", ErrLineItemConflict, item.ID)
+		}
+		return &existing, nil
+	}
+
+	if !AcceptsLineItems(b.state) {
+		return nil, fmt.Errorf("%w: %q is in %s", ErrNotOpen, b.id, b.state)
+	}
+	if item.Amount.Currency().Code != b.currency.Code {
+		return nil, fmt.Errorf("%w: bill %q is denominated in %s, line item is in %s",
+			money.ErrCurrencyMismatch, b.id, b.currency.Code, item.Amount.Currency().Code)
+	}
+	return nil, nil
+}
+
+// AddLineItem accrues a charge onto an open bill.
+//
+// The addition is idempotent by identifier: re-offering an identical item
+// returns the one already accrued and leaves the total untouched, so a client
+// that retries after a timeout cannot double-charge. Re-offering the identifier
+// with different detail is a conflict, not a retry.
+func (b *Bill) AddLineItem(item LineItem) (AddResult, error) {
+	existing, err := b.checkLineItem(item)
+	if err != nil {
+		return AddResult{}, err
+	}
+	if existing != nil {
+		return AddResult{
+			Outcome:      OutcomeAlreadyAccrued,
+			LineItem:     *existing,
+			RunningTotal: b.total,
+		}, nil
+	}
+
+	total, err := b.total.Add(item.Amount)
+	if err != nil {
+		return AddResult{}, err
+	}
+
+	b.items[item.ID] = item
+	b.order = append(b.order, item.ID)
+	b.total = total
+
+	return AddResult{
+		Outcome:      OutcomeCreated,
+		LineItem:     item,
+		RunningTotal: b.total,
+	}, nil
+}
+
+// Close freezes the bill's total and line items and records what closed it.
+//
+// Closing a bill that has already left OPEN is not an error. The caller asked
+// for the bill to be closed and the bill is closed; the returned snapshot
+// reports the trigger that actually caused it, so a request that lost a race
+// against the period-end deadline learns what happened without being handed a
+// failure for a state it wanted.
+func (b *Bill) Close(trigger Trigger, at time.Time) (Snapshot, error) {
+	if b.state != StateOpen {
+		return b.Snapshot(), nil
+	}
+	next, err := Transition(b.state, EventClose)
+	if err != nil {
+		return Snapshot{}, err
+	}
+	b.state = next
+	b.closedAt = at
+	b.closedBy = trigger
+	return b.Snapshot(), nil
+}
+
+// MarkInvoiced records that the invoice hand-off succeeded, completing the bill.
+func (b *Bill) MarkInvoiced() error {
+	if b.state == StateClosed {
+		return nil
+	}
+	next, err := Transition(b.state, EventInvoiced)
+	if err != nil {
+		return err
+	}
+	b.state = next
+	return nil
+}
+
+// LineItems returns the accrued line items in the order they were accrued.
+//
+// The slice is freshly allocated on every call, so a caller holding a snapshot
+// of a closed bill cannot have it altered underneath them.
+func (b *Bill) LineItems() []LineItem {
+	items := make([]LineItem, 0, len(b.order))
+	for _, id := range b.order {
+		items = append(items, b.items[id])
+	}
+	return items
+}
+
+// Snapshot returns the bill's externally visible state, copying the line items
+// so that the result is independent of any later mutation of the bill.
+func (b *Bill) Snapshot() Snapshot {
+	s := Snapshot{
+		ID:          b.id,
+		State:       b.state,
+		Currency:    b.currency,
+		PeriodStart: b.periodStart,
+		PeriodEnd:   b.periodEnd,
+		CreatedAt:   b.createdAt,
+		Total:       b.total,
+		LineItems:   b.LineItems(),
+	}
+	if b.state != StateOpen {
+		closedAt := b.closedAt
+		s.ClosedAt = &closedAt
+		s.ClosedBy = b.closedBy
+	}
+	return s
+}
