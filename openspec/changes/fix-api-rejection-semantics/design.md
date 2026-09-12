@@ -56,7 +56,7 @@ An open bill has no persisted row until it closes, so `loadInvoice` answers `Err
 
 The last row is why the predicate must be split rather than corrected in place: `CreateBill` genuinely wants `AlreadyStarted` to mean "this key already produced a bill", while `writeUpdateFailure` must never see it as absence. One name cannot carry both.
 
-*Alternative considered — keep one predicate and add a second for transients.* Rejected: it leaves the `AlreadyStarted` conflation in place, which is finding 9 and the trap that would re-break `CreateBill` when its conflict policy changes in decision 4.
+*Alternative considered — keep one predicate and add a second for transients.* Rejected: it leaves the `AlreadyStarted` conflation in place, which is finding 9. `CreateBill` depends on that error meaning "this key already produced a bill" (decision 4), so leaving it classified as absence keeps a live trap under the one caller that needs it.
 
 ### 2. `readBill` reports what actually failed
 
@@ -97,18 +97,48 @@ func CheckAgainstSnapshot(snap Snapshot, item LineItem) (*LineItem, error)
 
 reusing the same comparison `checkLineItem` uses, so the rule stays stated once. Note that `sameChargeAs` deliberately ignores `AccruedAt`; a storage-path comparison must too, since a retry carries a later timestamp than the stored item.
 
-### 4. Creation idempotency needs no fingerprint store
+### 4. Creation idempotency needs no fingerprint store, and no SDK helper
 
 `CreateBillRequest` is exactly `{currency, periodStart, periodEnd}`, and `bill.Snapshot` carries all three. The whole request is recoverable from the bill, so a reused key is checked by comparing against the bill itself — no dedup table, and the archived design's rule that uniqueness comes from Temporal survives intact.
 
-Two changes to `CreateBill`:
-
-- **Conflict policy `USE_EXISTING` -> `FAIL`.** Under `USE_EXISTING`, a start that attaches to a running execution returns a nil error, so the code cannot tell creating from attaching and every concurrent request reports `201`. Under `FAIL` the loser receives `WorkflowExecutionAlreadyStarted`, which is a definite signal: read the bill, compare parameters, answer `200` or `409`.
-- **Parameter comparison** in both the pre-check and the `AlreadyStarted` path, so a race cannot slip past the pre-check.
-
-**Sequenced after decision 1.** Flipping the conflict policy while `isWorkflowGone` still classifies `AlreadyStarted` as absent would route every duplicate creation into the `404` path.
+**Parameter comparison** happens in both the pre-check and the path taken when the bill already exists, so a race cannot slip past the pre-check.
 
 **Compare instants, not representations.** `periodStart` returns from the workflow as UTC, while a client may have sent `+04:00` for the same moment. `==` on `time.Time` compares wall clock, location and monotonic reading, so it would reject a correct retry as a conflict — a false `409` on a valid request, worse than the defect being fixed. Use `.Equal`.
+
+#### Reporting *which* request created the bill
+
+This was originally specified as a conflict-policy change: `USE_EXISTING -> FAIL`, on the reasoning that `USE_EXISTING` returns a nil error when a start attaches to a running execution, so the handler cannot tell creating from attaching, while under `FAIL` the loser would receive `WorkflowExecutionAlreadyStarted` as a definite signal.
+
+**The second half of that is false, and was disproven during implementation.** Four concurrent `client.ExecuteWorkflow` calls against one workflow id, under `CONFLICT_POLICY_FAIL`:
+
+```
+  attempt 0: nil error   runID=01a094de-d3bd-7367-ada2-f4d974c587b3
+  attempt 1: nil error   runID=01a094de-d3bd-7367-ada2-f4d974c587b3
+  attempt 2: nil error   runID=01a094de-d3bd-7367-ada2-f4d974c587b3
+  attempt 3: nil error   runID=01a094de-d3bd-7367-ada2-f4d974c587b3
+```
+
+Temporal deduplicates correctly — only one execution exists — but the SDK helper returns the existing run handle and a nil error to every caller regardless of conflict policy. The signal the design depended on is simply not delivered to it.
+
+**What is done instead:** creation calls `StartWorkflowExecution` on the service API directly and reads `Started` from the response, which is the distinction the SDK helper drops. Confirmed against the dev server:
+
+```
+  first call   ->  Started=true   RunId=01a094df-2b95-7259-b001-58b77859d3c8
+  second call  ->  Started=false  RunId=01a094df-2b95-7259-b001-58b77859d3c8
+```
+
+The conflict policy therefore stays `USE_EXISTING`: attaching is the ordinary outcome of a retry and should not be an error path. `REJECT_DUPLICATE` still stands, so a key whose bill has completed cannot quietly start a second one — decision 9 of the archived design.
+
+*Cost of dropping to the raw API.* The request must be built by hand — namespace, workflow type, task queue, encoded input, request id — and the workflow type is named by a string rather than a Go function reference. Two things keep that safe:
+
+- The workflow is **registered under the same `WorkflowTypeName` constant** the start request names, so renaming the Go function cannot silently orphan running bills. The constant matches the type recorded in the committed replay fixtures.
+- The **data converter is named once and shared** between the client and the raw start, since the raw call encodes its own payload. Were the two to differ, the workflow would receive input it could not read.
+
+A fresh `RequestId` per attempt is required: it identifies one start attempt, so two concurrent requests are two attempts and exactly one of them starts the bill. A shared value would make the server treat them as one retried request.
+
+*Alternative considered — amend the spec instead.* Weaken "exactly one `201`" to "at most one bill exists per key", which is already true and is the property that actually protects money. Rejected: the stronger statement is one a financial API should be able to make, and the cost of keeping it turned out to be one function.
+
+**Sequenced after decision 1.** `WorkflowExecutionAlreadyStarted` still reaches the creation path when a key names a *completed* bill, and while `isWorkflowGone` classified it as absent, that would have routed such a request into the `404` path.
 
 ### 5. Validate the amount before it reaches the worker
 
@@ -138,7 +168,9 @@ Clamp the timer duration at `workflow.go:232` regardless. `periodEnd.Sub(workflo
 
 - **The storage fallback in `AddLineItem` adds a database read to a rejection path.** → It runs only when the workflow cannot answer, which for a closed bill is the normal case and already true of `CloseBill`.
 
-- **`CONFLICT_POLICY_FAIL` turns a previously silent attach into an error path.** If the `AlreadyStarted` branch is wrong, duplicate creation breaks loudly. → Loud is the point; the current failure is silent. Covered by the concurrent-creation scenario.
+- **Creation calls the service API directly, bypassing the SDK helper.** The start request is hand-built, so the workflow type is a string rather than a Go function reference and the input is encoded by this code rather than by the client. Either could drift from what the worker expects. → The type name is a constant shared with registration, and the data converter is named once and shared with the client, so neither can drift silently. The replay fixtures pin the type name as a third check.
+
+- **The `Started` flag is a property of the server's response, not of the SDK contract.** A server too old to populate it would report `false` for every request, so nothing would ever answer `201`. → Verified against the dev server in use; worth re-checking against whatever runs in production before this ships. The failure is visible rather than silent — every creation answering `200` is obvious on the first request.
 
 - **Marshal-guarding zero `Money` can break unrelated call sites,** including logging. → Take it as a separate commit from the handler guard so a bisect separates them.
 

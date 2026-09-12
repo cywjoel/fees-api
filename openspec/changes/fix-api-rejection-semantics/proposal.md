@@ -54,7 +54,7 @@ None.
 ## Impact
 
 - **`billing/errors.go`** — `isWorkflowGone` split into distinct predicates; a transient class added to the reason/status tables.
-- **`billing/api.go`** — error handling in all four endpoints; storage fallback in `AddLineItem`; conflict policy and parameter comparison in `CreateBill`; amount validation; period validation.
+- **`billing/api.go`** — error handling in all four endpoints; storage fallback in `AddLineItem`; a raw `StartWorkflowExecution` call plus parameter comparison in `CreateBill`; amount validation; period validation.
 - **`internal/bill`** — a small helper so the line-item deduplication rule can be applied to a persisted snapshot without being reimplemented against it.
 - **`internal/billflow/workflow.go`** — `beginClose` returns its error. No change to the command sequence.
 - **Tests** — two red tests already written (`billing/errors_test.go`, and the wait-for-`CLOSED` fix in `e2e/api_test.go:325`) must go green; new cases for the transient class, the storage fallback, parameter mismatch, and the past period.
