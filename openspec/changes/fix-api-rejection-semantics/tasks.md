@@ -33,7 +33,7 @@
 ## 5. Request validation
 
 - [x] 5.1 Reject a line item whose amount carries no currency before dispatching the update, and verify task 1.3's case returns `422` with the `invalid_line_item` reason
-- [ ] 5.2 Make `Money.MarshalJSON` reject a zero currency, in a separate commit from 5.1, and verify the existing money suite still passes after auditing marshal sites including log lines
+- [x] 5.2 Make `Money.MarshalJSON` reject a zero currency, in a separate commit from 5.1, and verify the existing money suite still passes after auditing marshal sites including log lines
 - [x] 5.3 Reject a creation whose `periodEnd` has already passed, and verify task 1.6's case returns `422` and creates no bill
 - [x] 5.4 Clamp the period timer duration to a non-negative value in `internal/billflow`, and verify a bill cannot be born already closing even if validation is bypassed
 

@@ -151,7 +151,17 @@ type moneyJSON struct {
 }
 
 // MarshalJSON implements json.Marshaler.
+//
+// An amount with no currency is refused rather than encoded. The zero Money
+// would otherwise marshal as {"amount":"0","currency":"","minorUnits":0}, which
+// UnmarshalJSON then rejects - so it would cross a boundary happily and fail on
+// the far side, where the failure reads as the receiving service being broken
+// rather than the value being malformed. Refusing here keeps the complaint next
+// to the defect.
 func (m Money) MarshalJSON() ([]byte, error) {
+	if m.currency.IsZero() {
+		return nil, fmt.Errorf("money: refusing to encode an amount with no currency (%d minor units)", m.minorUnits)
+	}
 	return json.Marshal(moneyJSON{
 		Amount:     m.Decimal().StringFixed(m.currency.Exponent),
 		Currency:   m.currency.Code,

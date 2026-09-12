@@ -375,3 +375,26 @@ func TestStringRendersAmountWithCurrency(t *testing.T) {
 		})
 	}
 }
+
+// A zero Money has no currency, so it denominates nothing. Encoding it produced
+// {"amount":"0","currency":"","minorUnits":0}, which this package's own decoder
+// rejects - so the value crossed the wire and failed on the far side, where the
+// failure looks like the receiver being broken rather than the value being
+// malformed.
+func TestMarshalRefusesAnAmountWithNoCurrency(t *testing.T) {
+	if _, err := json.Marshal(money.Money{}); err == nil {
+		t.Fatal("encoding a zero Money succeeded; it must be refused, not sent as an empty currency")
+	}
+
+	type lineItem struct {
+		ID     string      `json:"id"`
+		Amount money.Money `json:"amount"`
+	}
+	if _, err := json.Marshal(lineItem{ID: "txn_1"}); err == nil {
+		t.Error("encoding a struct holding an unset Money succeeded; the defect is that it used to travel")
+	}
+
+	if _, err := json.Marshal(money.Zero(usd)); err != nil {
+		t.Errorf("a genuine zero amount in a real currency must still encode: %v", err)
+	}
+}
