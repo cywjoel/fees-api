@@ -22,6 +22,24 @@ var billsDB = sqldb.NewDatabase("bills", sqldb.DatabaseConfig{
 // ErrInvoiceNotFound is returned when no invoice has been persisted for a bill.
 var ErrInvoiceNotFound = errors.New("billing: invoice not found")
 
+// storageTimePrecision is the resolution a TIMESTAMPTZ column keeps.
+//
+// Go's time.Time carries nanoseconds and PostgreSQL's does not, so an instant
+// that travels through storage comes back truncated. Comparing a truncated
+// instant against the untruncated original finds them different, which is how a
+// correct retry came to be refused as idempotency-key reuse once a bill's
+// workflow had aged out and storage became the only source for its fee period.
+const storageTimePrecision = time.Microsecond
+
+// atStoragePrecision truncates an instant to the resolution it will survive at.
+//
+// Applied to a fee period on the way in, so that what a bill reports is what can
+// actually be recorded, and applied again wherever two instants are compared, so
+// that a bill created before that was true still matches a correct retry.
+func atStoragePrecision(t time.Time) time.Time {
+	return t.Truncate(storageTimePrecision)
+}
+
 // saveInvoice writes a frozen invoice and its line items.
 //
 // The write is idempotent because the activity that calls it may be retried:

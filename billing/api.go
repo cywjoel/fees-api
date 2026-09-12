@@ -70,10 +70,17 @@ type AddLineItemRequest struct {
 // workflow as UTC while a caller may have written the same moment with an offset;
 // == compares wall clock, location and monotonic reading, so it would refuse a
 // correct retry.
+//
+// Both sides are taken to storage precision first. A bill read back from Postgres
+// has lost its sub-microsecond digits, and comparing that against an untruncated
+// request refused a correct retry as key reuse - the same false 409 the Equal
+// rule above exists to prevent, arriving by a different route. Requests are
+// truncated on the way in too, so this is belt and braces for bills created
+// before that was so.
 func matchesRequest(snap bill.Snapshot, currency money.Currency, in CreateBillRequest) bool {
 	return snap.Currency.Code == currency.Code &&
-		snap.PeriodStart.Equal(in.PeriodStart) &&
-		snap.PeriodEnd.Equal(in.PeriodEnd)
+		atStoragePrecision(snap.PeriodStart).Equal(atStoragePrecision(in.PeriodStart)) &&
+		atStoragePrecision(snap.PeriodEnd).Equal(atStoragePrecision(in.PeriodEnd))
 }
 
 // writeKeyReuse refuses a key that already named a different bill.
@@ -139,6 +146,13 @@ func (s *Service) CreateBill(w http.ResponseWriter, req *http.Request) {
 			"currency must be one of "+joinCodes(money.Supported()))
 		return
 	}
+	// Before validation, not after: two instants less than a microsecond apart
+	// would otherwise satisfy "strictly after" and then collapse into one another
+	// on the way to storage, leaving a bill whose period does not end after it
+	// begins - which the invoice table's own CHECK constraint forbids.
+	in.PeriodStart = atStoragePrecision(in.PeriodStart)
+	in.PeriodEnd = atStoragePrecision(in.PeriodEnd)
+
 	if !in.PeriodEnd.After(in.PeriodStart) {
 		writeProblem(w, http.StatusUnprocessableEntity, billflow.ReasonInvalidPeriod,
 			"periodEnd must be strictly after periodStart")

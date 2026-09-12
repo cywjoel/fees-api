@@ -8,6 +8,8 @@ The request MUST supply a currency, a `periodStart`, and a `periodEnd`. The syst
 
 The system SHALL additionally reject a request whose `periodEnd` has already passed. A bill exists to accrue charges over a period that is still running; one whose period has ended can never accept a charge, and creating it would report success for a bill that is already closing.
 
+A fee period SHALL be recorded at a resolution the system can durably retain, and the bill SHALL report the period it recorded rather than the one it was sent. A caller that states a period more precisely than the system can store must be told what was actually recorded, because that is the value every later comparison and every later read will use.
+
 #### Scenario: Bill is created successfully
 
 - **WHEN** a client requests a new bill with currency `USD`, a `periodStart`, and a later `periodEnd` that has not yet passed
@@ -23,6 +25,12 @@ The system SHALL additionally reject a request whose `periodEnd` has already pas
 - **WHEN** a client requests a new bill whose `periodEnd` is in the past, even though it is after its `periodStart`
 - **THEN** the system responds `422 Unprocessable Content` and no bill is created
 - **AND** the system SHALL NOT respond `201 Created` for a bill that has already left `OPEN`
+
+#### Scenario: Fee period is recorded at the resolution it can be retained
+
+- **WHEN** a client creates a bill stating a fee period more precisely than the system can durably record
+- **THEN** the bill reports the period actually recorded, and every subsequent retrieval reports that same period
+- **AND** a later retry of that creation is recognised as the same request, whether the bill is read from its running workflow or from durable storage
 
 #### Scenario: Unsupported currency is rejected
 

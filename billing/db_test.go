@@ -324,3 +324,71 @@ func TestClosedInvoiceIsReadableWithNoWorkflowInvolved(t *testing.T) {
 		t.Error("closedAt is absent; a closed invoice must record when it closed")
 	}
 }
+
+// A fee period stated with nanosecond precision survives a storage round trip
+// only as far as microseconds, because that is all a TIMESTAMPTZ column keeps.
+//
+// This is the failure that refused a correct retry as idempotency-key reuse: the
+// bill was compared against a period read back from Postgres, which no longer
+// equalled the one the caller sent. It only ever appeared once a bill's workflow
+// had aged out of history and storage became the only source for its period, so
+// no test reached it - the same blind spot that hid the original defect.
+func TestFeePeriodComparisonSurvivesStorageTruncation(t *testing.T) {
+	ctx := context.Background()
+
+	// What time.Now() produces and RFC3339Nano transports.
+	rawStart := time.Date(2026, 9, 12, 10, 0, 0, 123456789, time.UTC)
+	rawEnd := rawStart.Add(time.Hour)
+
+	// What CreateBill records, having taken the period to storage precision.
+	in := CreateBillRequest{
+		Currency:    "USD",
+		PeriodStart: atStoragePrecision(rawStart),
+		PeriodEnd:   atStoragePrecision(rawEnd),
+	}
+
+	snap := testSnapshot("bill_period_precision", bill.StateClosed, testItem("txn_1", 100, "fee"))
+	snap.PeriodStart = in.PeriodStart
+	snap.PeriodEnd = in.PeriodEnd
+
+	if err := saveInvoice(ctx, snap); err != nil {
+		t.Fatalf("saveInvoice returned error: %v", err)
+	}
+	stored, err := loadInvoice(ctx, snap.ID)
+	if err != nil {
+		t.Fatalf("loadInvoice returned error: %v", err)
+	}
+
+	usd := money.MustLookup("USD")
+
+	if !matchesRequest(stored, usd, in) {
+		t.Errorf("a retry of the request that created this bill was not recognised\n"+
+			"  sent    %s\n  stored  %s\n"+
+			"The caller would receive 409 idempotency_key_reuse for the request that "+
+			"created the bill, where the spec requires 200 with the existing bill.",
+			in.PeriodStart.Format(time.RFC3339Nano), stored.PeriodStart.UTC().Format(time.RFC3339Nano))
+	}
+
+	// Belt and braces: a caller whose request still carries nanoseconds - a bill
+	// created before the period was truncated on the way in - must match too.
+	untruncated := CreateBillRequest{Currency: "USD", PeriodStart: rawStart, PeriodEnd: rawEnd}
+	if !matchesRequest(stored, usd, untruncated) {
+		t.Errorf("an untruncated request did not match the bill it created\n"+
+			"  sent    %s\n  stored  %s",
+			rawStart.Format(time.RFC3339Nano), stored.PeriodStart.UTC().Format(time.RFC3339Nano))
+	}
+
+	// A genuinely different period must still be refused, or the comparison has
+	// been loosened into uselessness rather than corrected.
+	elsewhere := CreateBillRequest{
+		Currency:    "USD",
+		PeriodStart: rawStart.Add(48 * time.Hour),
+		PeriodEnd:   rawEnd.Add(48 * time.Hour),
+	}
+	if matchesRequest(stored, usd, elsewhere) {
+		t.Error("a request for a different fee period matched; the comparison no longer discriminates")
+	}
+	if matchesRequest(stored, money.MustLookup("GEL"), in) {
+		t.Error("a request in a different currency matched")
+	}
+}
