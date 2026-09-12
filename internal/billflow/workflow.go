@@ -167,19 +167,22 @@ func BillWorkflow(ctx workflow.Context, in StartBillInput) (bill.Snapshot, error
 	// beginClose is the single place the bill's state changes to CLOSING. Both
 	// triggers route through it, and it is a no-op once the bill has left OPEN,
 	// so whichever arrives second changes nothing.
-	beginClose := func(trigger bill.Trigger) bill.Snapshot {
+	beginClose := func(trigger bill.Trigger) (bill.Snapshot, error) {
 		snap, closeErr := b.Close(trigger, workflow.Now(ctx))
 		if closeErr != nil {
-			// Close only errors on an impossible transition, which the state
-			// machine table rules out from OPEN.
+			// Unreachable today: Close errors only on a transition the state table
+			// forbids, and it cannot be reached from OPEN. Returned rather than
+			// logged all the same, because swallowing it answered 202 Accepted with
+			// a snapshot still reading OPEN - telling a caller its bill was closing
+			// when nothing had happened.
 			logger.Error("closing bill failed", "billID", b.ID(), "error", closeErr)
-			return b.Snapshot()
+			return bill.Snapshot{}, closeErr
 		}
 		if !closeSignalled {
 			closeSignalled = true
 			requestClose.Set(nil, nil)
 		}
-		return snap
+		return snap, nil
 	}
 
 	// Handlers are registered before the first yield so that updates delivered
@@ -227,7 +230,7 @@ func BillWorkflow(ctx workflow.Context, in StartBillInput) (bill.Snapshot, error
 		// closed and it is - so it returns the frozen invoice with the trigger
 		// that actually caused the close, rather than an error.
 		func(ctx workflow.Context, _ CloseBillInput) (bill.Snapshot, error) {
-			return beginClose(bill.TriggerAPIRequest), nil
+			return beginClose(bill.TriggerAPIRequest)
 		},
 		workflow.UpdateHandlerOptions{})
 	if err != nil {
@@ -252,7 +255,11 @@ func BillWorkflow(ctx workflow.Context, in StartBillInput) (bill.Snapshot, error
 	selector.AddFuture(periodTimer, func(workflow.Future) {
 		// Guarded, because an early close may already have won this race.
 		if b.State() == bill.StateOpen {
-			beginClose(bill.TriggerPeriodEnd)
+			if _, closeErr := beginClose(bill.TriggerPeriodEnd); closeErr != nil {
+				// The main loop's Await below keeps waiting, and the bill stays
+				// visibly OPEN rather than being reported as something it is not.
+				logger.Error("period-end close failed", "billID", b.ID(), "error", closeErr)
+			}
 		}
 	})
 	selector.AddFuture(closeRequested, func(workflow.Future) {

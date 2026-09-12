@@ -39,14 +39,14 @@
 
 ## 6. Close reporting
 
-- [ ] 6.1 Make `beginClose` return its error rather than logging it and returning an `OPEN` snapshot, and verify `TestUpdateHandlersAreYieldFree` still passes because no yield point was introduced
+- [x] 6.1 Make `beginClose` return its error rather than logging it and returning an `OPEN` snapshot, and verify `TestUpdateHandlersAreYieldFree` still passes because no yield point was introduced
 
 ## 7. Verify nothing regressed
 
-- [ ] 7.1 Run `go test ./internal/... -race` and verify the domain, workflow and money suites are unchanged and green
-- [ ] 7.2 Run `TestReplayCommittedHistories` and verify it passes against the committed fixtures without re-recording them, confirming bills open across the deploy will resume
-- [ ] 7.3 Run the full end-to-end suite against a live service and verify every case in the status matrix passes, including the previously failing closed-bill case
-- [ ] 7.4 Verify every one of the reproductions recorded in the proposal now returns the specified status, and that no reproduction still yields `404` for a bill that `GET` answers `200` for
+- [x] 7.1 Run `go test ./internal/... -race` and verify the domain, workflow and money suites are unchanged and green
+- [x] 7.2 Run `TestReplayCommittedHistories` and verify it passes against the committed fixtures without re-recording them, confirming bills open across the deploy will resume
+- [x] 7.3 Run the full end-to-end suite against a live service and verify every case in the status matrix passes, including the previously failing closed-bill case
+- [x] 7.4 Verify every one of the reproductions recorded in the proposal now returns the specified status, and that no reproduction still yields `404` for a bill that `GET` answers `200` for
 
 ## 8. Close the coverage gap that hid this
 
