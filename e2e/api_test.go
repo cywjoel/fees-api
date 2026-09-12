@@ -21,6 +21,7 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"sync"
 	"testing"
 	"time"
 )
@@ -145,6 +146,177 @@ func waitForState(t *testing.T, billID, want string, within time.Duration) respo
 	t.Fatalf("bill %s did not reach %s within %s; last state was %v (%s)",
 		billID, want, within, last.body["state"], last.raw)
 	return last
+}
+
+// --- 1.3 to 1.6: defects pinned before their fixes --------------------------
+//
+// These fail today. They document defects found reviewing the initial commit,
+// so that the fixes in groups 4 and 5 are verified by something durable and
+// executed rather than by an ad-hoc request - which is how the defect they sit
+// alongside survived in the first place.
+
+// 1.3 A body carrying no amount decodes to a zero Money whose currency is empty.
+// Nothing validates it before dispatch, and the update argument then fails to
+// deserialise on the worker, so the validator never runs and the caller is told
+// the service broke rather than that its request was malformed.
+func TestLineItemWithoutAmountIsRejectedAsMalformed(t *testing.T) {
+	requireAPI(t)
+
+	billID := billIDOf(t, createBill(t, "USD", time.Hour, nil))
+
+	got := do(t, http.MethodPut, "/bills/"+billID+"/line-items/txn_no_amount",
+		map[string]any{"description": "fee with no amount"}, nil)
+
+	if got.status != http.StatusUnprocessableEntity {
+		t.Fatalf("status = %d, want 422 (%s)\n\n"+
+			"A 500 here means the amount reached the worker unvalidated and failed to "+
+			"deserialise, so the rejection never happened in the validator where it belongs.",
+			got.status, got.raw)
+	}
+	if got.reason() != "invalid_line_item" {
+		t.Errorf("reason = %q, want invalid_line_item", got.reason())
+	}
+}
+
+// 1.4 Under CONFLICT_POLICY_USE_EXISTING a start that attaches to a running
+// execution returns no error, so the handler cannot tell creating from
+// attaching and every concurrent request claims to have created the bill.
+func TestConcurrentCreationsSharingAKeyReportOneCreation(t *testing.T) {
+	requireAPI(t)
+
+	const attempts = 4
+	key := fmt.Sprintf("concurrent-%d", time.Now().UnixNano())
+	headers := map[string]string{"Idempotency-Key": key}
+
+	var (
+		wg      sync.WaitGroup
+		mu      sync.Mutex
+		results = make([]response, 0, attempts)
+	)
+	for i := 0; i < attempts; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			r := createBill(t, "USD", time.Hour, headers)
+			mu.Lock()
+			results = append(results, r)
+			mu.Unlock()
+		}()
+	}
+	wg.Wait()
+
+	created, existing, ids := 0, 0, map[string]bool{}
+	for _, r := range results {
+		switch r.status {
+		case http.StatusCreated:
+			created++
+		case http.StatusOK:
+			existing++
+		default:
+			t.Errorf("unexpected status %d (%s)", r.status, r.raw)
+		}
+		if id, ok := r.body["id"].(string); ok {
+			ids[id] = true
+		}
+	}
+
+	if created != 1 {
+		t.Errorf("%d requests reported 201 Created, want exactly 1 (%d reported 200)\n\n"+
+			"Every concurrent request claiming creation means a caller counting 201s "+
+			"believes several bills exist for one key.", created, existing)
+	}
+	if len(ids) != 1 {
+		t.Errorf("requests returned %d distinct bill ids, want 1: %v", len(ids), ids)
+	}
+}
+
+// 1.5 The idempotency pre-check returns the bill a key already created without
+// comparing it against what was asked for, so a key reused by accident is
+// answered with a bill in the wrong currency, for the wrong period.
+func TestKeyReusedWithDifferentParametersIsRejected(t *testing.T) {
+	requireAPI(t)
+
+	headers := map[string]string{"Idempotency-Key": fmt.Sprintf("reuse-%d", time.Now().UnixNano())}
+
+	first := createBill(t, "USD", time.Hour, headers)
+	if first.status != http.StatusCreated {
+		t.Fatalf("first creation = %d, want 201 (%s)", first.status, first.raw)
+	}
+
+	now := time.Now().UTC().Add(720 * time.Hour)
+	second := do(t, http.MethodPost, "/bills", map[string]any{
+		"currency":    "GEL",
+		"periodStart": now.Format(time.RFC3339Nano),
+		"periodEnd":   now.Add(time.Hour).Format(time.RFC3339Nano),
+	}, headers)
+
+	if second.status != http.StatusConflict {
+		t.Fatalf("status = %d, want 409 (%s)\n\n"+
+			"A 200 here returns a USD bill to a caller that asked for a GEL one, for a "+
+			"different period. It will then accrue GEL charges that are all rejected 422, "+
+			"with nothing explaining why.", second.status, second.raw)
+	}
+}
+
+// The same key with the same period stated in another time zone denotes the same
+// instant and must still be a retry. Comparing with == rather than time.Equal
+// would reject a correct request - a false 409, worse than the defect above.
+func TestKeyReuseComparesInstantsNotRepresentations(t *testing.T) {
+	requireAPI(t)
+
+	headers := map[string]string{"Idempotency-Key": fmt.Sprintf("tz-%d", time.Now().UnixNano())}
+
+	start := time.Now().UTC().Truncate(time.Second)
+	end := start.Add(time.Hour)
+
+	first := do(t, http.MethodPost, "/bills", map[string]any{
+		"currency":    "USD",
+		"periodStart": start.Format(time.RFC3339),
+		"periodEnd":   end.Format(time.RFC3339),
+	}, headers)
+	if first.status != http.StatusCreated {
+		t.Fatalf("first creation = %d, want 201 (%s)", first.status, first.raw)
+	}
+
+	elsewhere := time.FixedZone("UTC+4", 4*60*60)
+	second := do(t, http.MethodPost, "/bills", map[string]any{
+		"currency":    "USD",
+		"periodStart": start.In(elsewhere).Format(time.RFC3339),
+		"periodEnd":   end.In(elsewhere).Format(time.RFC3339),
+	}, headers)
+
+	if second.status != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (%s)\n\n"+
+			"The same instant written with a different offset is the same fee period. "+
+			"Rejecting it refuses a correct retry.", second.status, second.raw)
+	}
+}
+
+// 1.6 Creation checks only that periodEnd follows periodStart, never that it is
+// still ahead. A period that has already ended builds a timer with a negative
+// duration, which fires at once, so the bill is closing before the caller has
+// read the response that says it was created.
+func TestFeePeriodAlreadyEndedIsRejected(t *testing.T) {
+	requireAPI(t)
+
+	start := time.Now().UTC().Add(-720 * time.Hour)
+	got := do(t, http.MethodPost, "/bills", map[string]any{
+		"currency":    "USD",
+		"periodStart": start.Format(time.RFC3339Nano),
+		"periodEnd":   start.Add(24 * time.Hour).Format(time.RFC3339Nano),
+	}, map[string]string{"Idempotency-Key": fmt.Sprintf("past-%d", time.Now().UnixNano())})
+
+	if got.status != http.StatusUnprocessableEntity {
+		t.Fatalf("status = %d with state %v, want 422 (%s)\n\n"+
+			"A 201 carrying state CLOSING reports success for a bill that can never "+
+			"accept a charge.", got.status, got.body["state"], got.raw)
+	}
+	if got.reason() != "invalid_period" {
+		t.Errorf("reason = %q, want invalid_period", got.reason())
+	}
+	if id, ok := got.body["id"].(string); ok && id != "" {
+		t.Errorf("a bill was created (%s) for a period that had already ended", id)
+	}
 }
 
 // --- 10.1 ------------------------------------------------------------------

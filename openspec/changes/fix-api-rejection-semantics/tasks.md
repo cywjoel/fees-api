@@ -2,10 +2,10 @@
 
 - [x] 1.1 Add `billing/errors_test.go` asserting `WorkflowNotReady` and `WorkflowExecutionAlreadyStarted` are not classified as absent, and verify it fails today on both cases while the `NotFound` control passes
 - [x] 1.2 Make the existing `409 once the bill is no longer open` case in `e2e/api_test.go` wait for `CLOSED` before offering the late charge, and verify it now fails with `404` where it previously passed against `CLOSING`
-- [ ] 1.3 Add a failing case for a line item body with no `amount`, and verify it returns `500` today where `422` is required
-- [ ] 1.4 Add a failing case for concurrent creations sharing one idempotency key, and verify every request reports `201` today
-- [ ] 1.5 Add a failing case for an idempotency key reused with a different currency and period, and verify the original bill is returned today
-- [ ] 1.6 Add a failing case for a fee period whose `periodEnd` has passed, and verify it returns `201` carrying `state: CLOSING` today
+- [x] 1.3 Add a failing case for a line item body with no `amount`, and verify it returns `500` today where `422` is required
+- [x] 1.4 Add a failing case for concurrent creations sharing one idempotency key, and verify every request reports `201` today
+- [x] 1.5 Add a failing case for an idempotency key reused with a different currency and period, and verify the original bill is returned today
+- [x] 1.6 Add a failing case for a fee period whose `periodEnd` has passed, and verify it returns `201` carrying `state: CLOSING` today
 
 ## 2. Separate absence from unavailability
 
