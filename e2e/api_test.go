@@ -528,12 +528,102 @@ func TestAddLineItemStatusMatrix(t *testing.T) {
 		}
 	})
 
+	// Spec: billing/line-item-accrual - "Retry of an invoiced charge after the
+	// closing process has finished". The 200 above was answered by the running
+	// workflow; this one has to be answered from the invoice, because no live
+	// execution remains. A caller retrying after a timeout must be told the charge
+	// is present, not that the bill is unknown - otherwise it may compensate for
+	// money that is genuinely on the invoice.
+	t.Run("200 for a retry of an invoiced charge once the workflow has finished", func(t *testing.T) {
+		got := addItem(t, billID, "txn_1", 500, "USD", "card fee")
+		if got.status != http.StatusOK {
+			t.Fatalf("status = %d, want 200 (%s)", got.status, got.raw)
+		}
+		if outcome, _ := got.body["outcome"].(string); outcome != "already_accrued" {
+			t.Errorf("outcome = %q, want already_accrued", outcome)
+		}
+	})
+
 	t.Run("404 for a bill that does not exist", func(t *testing.T) {
 		got := addItem(t, "bill_nope", "txn_1", 500, "USD", "card fee")
 		if got.status != http.StatusNotFound {
 			t.Fatalf("status = %d, want 404 (%s)", got.status, got.raw)
 		}
 	})
+}
+
+// Spec: billing/line-item-accrual - "Simultaneous additions are all retained".
+//
+// This is the claim the whole design rests on, and until now it was asserted in
+// prose and exercised nowhere. A workflow executes as a single-threaded
+// deterministic coroutine scheduler, so concurrent additions to one bill are
+// ordered by construction - no row lock, no optimistic-concurrency retry, no lost
+// update. The domain cannot demonstrate that, because Bill is deliberately not
+// safe for concurrent use: serialising writes is the workflow's job, so the proof
+// has to come through the real API against a real worker.
+//
+// Distinct amounts make a lost update visible rather than merely possible: a
+// dropped write changes the total by a unique value, so the failure names itself.
+func TestConcurrentLineItemsAreAllRetained(t *testing.T) {
+	requireAPI(t)
+
+	billID := billIDOf(t, createBill(t, "USD", time.Hour, nil))
+
+	const items = 24
+	var (
+		wg       sync.WaitGroup
+		mu       sync.Mutex
+		statuses = map[int]int{}
+		wantSum  int64
+	)
+	for i := 0; i < items; i++ {
+		amount := int64(100 + i) // distinct, so a lost write is identifiable
+		wantSum += amount
+		wg.Add(1)
+		go func(i int, amount int64) {
+			defer wg.Done()
+			r := addItem(t, billID, fmt.Sprintf("txn_%02d", i), amount, "USD", "concurrent fee")
+			mu.Lock()
+			statuses[r.status]++
+			mu.Unlock()
+		}(i, amount)
+	}
+	wg.Wait()
+
+	if got := statuses[http.StatusCreated]; got != items {
+		t.Errorf("%d additions reported 201, want %d (all statuses: %v)", got, items, statuses)
+	}
+
+	final := do(t, http.MethodGet, "/bills/"+billID, nil, nil)
+	if final.status != http.StatusOK {
+		t.Fatalf("GET = %d, want 200 (%s)", final.status, final.raw)
+	}
+
+	lineItems, _ := final.body["lineItems"].([]any)
+	if len(lineItems) != items {
+		t.Errorf("bill carries %d line items, want %d: a concurrent write was lost", len(lineItems), items)
+	}
+
+	seen := map[string]bool{}
+	for _, raw := range lineItems {
+		if item, ok := raw.(map[string]any); ok {
+			id, _ := item["id"].(string)
+			if seen[id] {
+				t.Errorf("line item %q appears more than once", id)
+			}
+			seen[id] = true
+		}
+	}
+	for i := 0; i < items; i++ {
+		if id := fmt.Sprintf("txn_%02d", i); !seen[id] {
+			t.Errorf("line item %q is missing from the bill", id)
+		}
+	}
+
+	if got := final.totalMinorUnits(t); got != wantSum {
+		t.Errorf("total = %d minor units, want %d: the total is not the exact sum of "+
+			"every charge, so a concurrent write was lost or double-counted", got, wantSum)
+	}
 }
 
 // --- 6.3 -------------------------------------------------------------------

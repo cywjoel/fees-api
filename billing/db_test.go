@@ -74,9 +74,9 @@ func TestMigrationCreatesTheInvoiceSchema(t *testing.T) {
 	}
 }
 
-// Spec: billing/bill-lifecycle - "Closed bill remains retrievable long after
-// closure". Also task 5.2: the write must converge, because Temporal runs an
-// activity at least once and a retry must not duplicate a charge.
+// The write must converge: Temporal runs an activity at least once, so a worker
+// that completes the write and crashes before recording that it did will run it
+// again, and a retry must not duplicate a charge.
 func TestSaveInvoiceIsIdempotent(t *testing.T) {
 	ctx := context.Background()
 	snap := testSnapshot("bill_idem", bill.StateClosing,
@@ -266,5 +266,61 @@ func TestSaveInvoiceWithNoLineItems(t *testing.T) {
 	}
 	if len(got.LineItems) != 0 {
 		t.Errorf("line items = %d, want 0", len(got.LineItems))
+	}
+}
+
+// Spec: billing/bill-lifecycle - "Closed bill remains retrievable long after
+// closure", and "A closed bill SHALL remain retrievable indefinitely, and SHALL
+// NOT become unavailable through the passage of time".
+//
+// The passage of time itself cannot be tested here: what expires is Temporal's
+// history retention, twenty-four hours on the dev server and days to weeks in
+// production. What can be tested is the property that makes the requirement hold
+// - that the invoice is readable with no workflow in the picture at all.
+//
+// This test never starts one. It writes an invoice the way the closing activity
+// does and reads it back through the same function the API uses once a workflow
+// is gone, which is precisely the path a bill takes after its history has aged
+// out. A Temporal query is a view of live process state, not storage, and this is
+// the test that says so.
+func TestClosedInvoiceIsReadableWithNoWorkflowInvolved(t *testing.T) {
+	ctx := context.Background()
+
+	snap := testSnapshot("bill_outlives_its_workflow", bill.StateClosed,
+		testItem("txn_1", 1234, "card fee"),
+		testItem("txn_2", 66, "transfer fee"),
+	)
+	if err := saveInvoice(ctx, snap); err != nil {
+		t.Fatalf("saveInvoice returned error: %v", err)
+	}
+
+	got, err := loadInvoice(ctx, snap.ID)
+	if err != nil {
+		t.Fatalf("loadInvoice returned error: %v", err)
+	}
+
+	if got.State != bill.StateClosed {
+		t.Errorf("state = %s, want CLOSED", got.State)
+	}
+	if got.Total.MinorUnits() != 1300 {
+		t.Errorf("total = %d minor units, want 1300", got.Total.MinorUnits())
+	}
+	if !got.Total.Equal(snap.Total) {
+		t.Errorf("total = %s, want the %s it was closed with", got.Total, snap.Total)
+	}
+	if len(got.LineItems) != 2 {
+		t.Fatalf("line items = %d, want 2", len(got.LineItems))
+	}
+	for i, want := range snap.LineItems {
+		if got.LineItems[i].ID != want.ID || !got.LineItems[i].Amount.Equal(want.Amount) {
+			t.Errorf("line item %d = %s %s, want %s %s",
+				i, got.LineItems[i].ID, got.LineItems[i].Amount, want.ID, want.Amount)
+		}
+	}
+	if got.ClosedBy != snap.ClosedBy {
+		t.Errorf("closedBy = %q, want %q", got.ClosedBy, snap.ClosedBy)
+	}
+	if got.ClosedAt == nil {
+		t.Error("closedAt is absent; a closed invoice must record when it closed")
 	}
 }
