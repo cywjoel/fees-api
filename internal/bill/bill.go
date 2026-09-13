@@ -247,8 +247,20 @@ func (b *Bill) checkLineItem(item LineItem, assertCustomerID string) (*LineItem,
 	}
 
 	if assertCustomerID != "" && assertCustomerID != b.customerID {
-		return nil, fmt.Errorf("%w: bill %q belongs to %q, line item states %q",
-			ErrCustomerMismatch, b.id, b.customerID, assertCustomerID)
+		// The bill's own customer is deliberately not named.
+		//
+		// A check that reveals the right answer when the caller guesses wrong is a
+		// lookup with extra steps. Today that leaks nothing, because retrieving the
+		// bill reports its customer anyway - but the design expects authentication
+		// upstream, and the moment retrieval starts refusing strangers this message
+		// would keep answering the question retrieval has stopped answering. Whoever
+		// builds that layer will check the read endpoints; nobody thinks of an error
+		// message as somewhere data escapes from.
+		//
+		// The caller learns what it needs: it addressed the wrong bill, and should
+		// fix the id it computed.
+		return nil, fmt.Errorf("%w: line item states a customer that is not the one bill %q belongs to",
+			ErrCustomerMismatch, b.id)
 	}
 
 	// Deduplication precedes the state check. An identical retry of an item that
@@ -293,8 +305,9 @@ func CheckAgainstSnapshot(snap Snapshot, item LineItem, assertCustomerID string)
 	// First, as on the live path: addressing the wrong bill makes everything
 	// after it a fact about a bill the caller did not mean to reach.
 	if assertCustomerID != "" && assertCustomerID != snap.CustomerID {
-		return nil, fmt.Errorf("%w: bill %q belongs to %q, line item states %q",
-			ErrCustomerMismatch, snap.ID, snap.CustomerID, assertCustomerID)
+		// Named neither here nor on the live path; see checkLineItem.
+		return nil, fmt.Errorf("%w: line item states a customer that is not the one bill %q belongs to",
+			ErrCustomerMismatch, snap.ID)
 	}
 	for _, existing := range snap.LineItems {
 		if existing.ID != item.ID {

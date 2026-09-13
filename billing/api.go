@@ -94,12 +94,17 @@ func matchesRequest(snap bill.Snapshot, currency money.Currency, in CreateBillRe
 }
 
 // writeKeyReuse refuses a key that already named a different bill.
+//
+// The existing bill's currency and fee period are deliberately not echoed, for
+// the same reason the customer is not named on a mismatch: an error that reports
+// another request's parameters back to whoever asks is a read endpoint wearing a
+// 409. The caller is told its key is already spoken for and what to do about it,
+// which is all it can act on.
 func writeKeyReuse(w http.ResponseWriter, billID string, snap bill.Snapshot) {
+	_ = snap
 	writeProblem(w, http.StatusConflict, reasonKeyReuse,
-		"idempotency key already created bill "+billID+" in "+snap.Currency.Code+
-			" for "+snap.PeriodStart.UTC().Format(time.RFC3339)+" to "+
-			snap.PeriodEnd.UTC().Format(time.RFC3339)+
-			"; reusing it for different parameters would return a bill that was not asked for")
+		"this idempotency key already created bill "+billID+" with different parameters; "+
+			"retry with the parameters that key was first used for, or use a different key")
 }
 
 // validateLineItemRequest reports what is wrong with a charge before it is sent
