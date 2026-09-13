@@ -92,7 +92,16 @@ type StartBillInput struct {
 
 // AddLineItemInput accrues one charge.
 type AddLineItemInput struct {
-	ItemID      string      `json:"itemId"`
+	ItemID string `json:"itemId"`
+
+	// CustomerID is what the caller believes the bill's customer to be, or empty
+	// when it did not say. Compared in the validator, never stored.
+	//
+	// A history recorded before this field existed decodes it as empty, and an
+	// empty assertion is deliberately not a mismatch - treating absence as
+	// disagreement would branch on it and break replay.
+	CustomerID string `json:"customerId,omitempty"`
+
 	Amount      money.Money `json:"amount"`
 	Description string      `json:"description"`
 }
@@ -211,7 +220,7 @@ func BillWorkflow(ctx workflow.Context, in StartBillInput) (bill.Snapshot, error
 				Amount:      req.Amount,
 				Description: req.Description,
 				AccruedAt:   workflow.Now(ctx),
-			})
+			}, req.CustomerID)
 		},
 		workflow.UpdateHandlerOptions{
 			// Validator: rejects synchronously, so the caller gets a real refusal
@@ -222,7 +231,7 @@ func BillWorkflow(ctx workflow.Context, in StartBillInput) (bill.Snapshot, error
 					Amount:      req.Amount,
 					Description: req.Description,
 					AccruedAt:   workflow.Now(ctx),
-				}))
+				}, req.CustomerID))
 			},
 		})
 	if err != nil {

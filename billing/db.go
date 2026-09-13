@@ -53,6 +53,13 @@ func saveInvoice(ctx context.Context, snap bill.Snapshot) error {
 	if snap.ClosedAt == nil {
 		return fmt.Errorf("billing: refusing to persist bill %q with no closure time", snap.ID)
 	}
+	if snap.CustomerID == "" {
+		// Checked here as well as by the column constraint, so the failure names
+		// itself instead of arriving as a constraint violation from the driver.
+		// Reachable only for a bill started before bills had customers.
+		return fmt.Errorf("billing: refusing to persist bill %q with no customer; "+
+			"an invoice has to be billable to someone", snap.ID)
+	}
 
 	tx, err := billsDB.Begin(ctx)
 	if err != nil {

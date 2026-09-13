@@ -437,3 +437,23 @@ func TestCustomerIdentifierIsOpaque(t *testing.T) {
 		}
 	}
 }
+
+// Finding 2: NOT NULL was chosen over a nullable column so that "an invoice with
+// no payee" would stop being representable, and an empty string is not NULL. A
+// bill started before bills had customers replays with an empty one, and closing
+// it wrote a permanently ownerless invoice.
+//
+// It must now fail loudly instead. That is the deliberate cost of the fix: such a
+// bill cannot be persisted at all, which is better than recording an invoice
+// nobody can be billed for.
+func TestOwnerlessInvoiceIsRefused(t *testing.T) {
+	ctx := context.Background()
+	snap := testSnapshot("bill_no_owner", bill.StateClosed, testItem("txn_1", 100, "fee"))
+	snap.CustomerID = ""
+
+	if err := saveInvoice(ctx, snap); err == nil {
+		got, _ := loadInvoice(ctx, snap.ID)
+		t.Fatalf("an invoice with no customer was persisted and read back as %q\n\n"+
+			"NOT NULL does not prevent this: '' is not NULL.", got.CustomerID)
+	}
+}

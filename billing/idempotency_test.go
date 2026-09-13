@@ -84,3 +84,17 @@ func TestNoKeyYieldsDistinctUnkeyedBills(t *testing.T) {
 		t.Errorf("two unkeyed creations produced the same id (%s)", first)
 	}
 }
+
+// Finding 1: scoping the key changed how every keyed bill id is derived, so a
+// retry issued after the change computes an id its original request never used.
+// Without a fallback the pre-check finds nothing and a second bill is created
+// for a period already being billed - the customer billed twice, silently.
+func TestLegacyAndScopedIdsDiffer(t *testing.T) {
+	legacy, _ := billIDFor("september-2026")
+	scoped, _ := billIDForCustomer("acme", "september-2026")
+
+	if legacy == scoped {
+		t.Fatal("the derivations coincide; this test no longer describes the hazard")
+	}
+	t.Logf("a retry spanning the change looks for %s, its bill is at %s", scoped, legacy)
+}

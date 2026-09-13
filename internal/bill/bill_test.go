@@ -85,7 +85,7 @@ func TestNewBillRequiresIDAndCurrency(t *testing.T) {
 func TestAddLineItemAccumulatesRunningTotal(t *testing.T) {
 	b := newOpenBill(t)
 
-	first, err := b.AddLineItem(item("txn_1", 1255, usd, "card fee"))
+	first, err := b.AddLineItem(item("txn_1", 1255, usd, "card fee"), "")
 	if err != nil {
 		t.Fatalf("AddLineItem returned error: %v", err)
 	}
@@ -96,7 +96,7 @@ func TestAddLineItemAccumulatesRunningTotal(t *testing.T) {
 		t.Errorf("running total after first = %d, want %d", got, want)
 	}
 
-	second, err := b.AddLineItem(item("txn_2", 500, usd, "transfer fee"))
+	second, err := b.AddLineItem(item("txn_2", 500, usd, "transfer fee"), "")
 	if err != nil {
 		t.Fatalf("AddLineItem returned error: %v", err)
 	}
@@ -114,7 +114,7 @@ func TestAddLineItemIsIdempotentByIdentifier(t *testing.T) {
 	b := newOpenBill(t)
 	in := item("txn_1", 500, usd, "card fee")
 
-	first, err := b.AddLineItem(in)
+	first, err := b.AddLineItem(in, "")
 	if err != nil {
 		t.Fatalf("first AddLineItem returned error: %v", err)
 	}
@@ -123,7 +123,7 @@ func TestAddLineItemIsIdempotentByIdentifier(t *testing.T) {
 	}
 
 	for i := 0; i < 5; i++ {
-		retry, err := b.AddLineItem(in)
+		retry, err := b.AddLineItem(in, "")
 		if err != nil {
 			t.Fatalf("retry %d returned error: %v", i, err)
 		}
@@ -149,14 +149,14 @@ func TestAddLineItemIsIdempotentByIdentifier(t *testing.T) {
 func TestRetryWithLaterTimestampIsStillTheSameCharge(t *testing.T) {
 	b := newOpenBill(t)
 	original := item("txn_1", 500, usd, "card fee")
-	if _, err := b.AddLineItem(original); err != nil {
+	if _, err := b.AddLineItem(original, ""); err != nil {
 		t.Fatalf("AddLineItem returned error: %v", err)
 	}
 
 	retry := original
 	retry.AccruedAt = original.AccruedAt.Add(30 * time.Second)
 
-	got, err := b.AddLineItem(retry)
+	got, err := b.AddLineItem(retry, "")
 	if err != nil {
 		t.Fatalf("retry returned error: %v", err)
 	}
@@ -180,11 +180,11 @@ func TestAddLineItemRejectsConflictingDetail(t *testing.T) {
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			b := newOpenBill(t)
-			if _, err := b.AddLineItem(item("txn_1", 500, usd, "card fee")); err != nil {
+			if _, err := b.AddLineItem(item("txn_1", 500, usd, "card fee"), ""); err != nil {
 				t.Fatalf("AddLineItem returned error: %v", err)
 			}
 
-			if _, err := b.AddLineItem(tc.conflict); !errors.Is(err, bill.ErrLineItemConflict) {
+			if _, err := b.AddLineItem(tc.conflict, ""); !errors.Is(err, bill.ErrLineItemConflict) {
 				t.Fatalf("conflicting add error = %v, want ErrLineItemConflict", err)
 			}
 			if got, want := b.Total().MinorUnits(), int64(500); got != want {
@@ -206,7 +206,7 @@ func TestAddLineItemRejectsConflictingDetail(t *testing.T) {
 func TestAddLineItemRejectsCurrencyMismatch(t *testing.T) {
 	b := newOpenBill(t)
 
-	_, err := b.AddLineItem(item("txn_1", 500, gel, "card fee"))
+	_, err := b.AddLineItem(item("txn_1", 500, gel, "card fee"), "")
 	if !errors.Is(err, money.ErrCurrencyMismatch) {
 		t.Fatalf("GEL item on a USD bill error = %v, want ErrCurrencyMismatch", err)
 	}
@@ -231,7 +231,7 @@ func TestAddLineItemRejectsMissingDetail(t *testing.T) {
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			b := newOpenBill(t)
-			if _, err := b.AddLineItem(tc.in); !errors.Is(err, bill.ErrInvalidLineItem) {
+			if _, err := b.AddLineItem(tc.in, ""); !errors.Is(err, bill.ErrInvalidLineItem) {
 				t.Fatalf("error = %v, want ErrInvalidLineItem", err)
 			}
 		})
@@ -267,12 +267,12 @@ func TestAddLineItemRejectedOnceBillLeavesOpen(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			b := newOpenBill(t)
-			if _, err := b.AddLineItem(item("txn_1", 500, usd, "card fee")); err != nil {
+			if _, err := b.AddLineItem(item("txn_1", 500, usd, "card fee"), ""); err != nil {
 				t.Fatalf("AddLineItem returned error: %v", err)
 			}
 			tc.advance(t, b)
 
-			_, err := b.AddLineItem(item("txn_2", 700, usd, "late fee"))
+			_, err := b.AddLineItem(item("txn_2", 700, usd, "late fee"), "")
 			if !errors.Is(err, bill.ErrNotOpen) {
 				t.Fatalf("add to a %s bill error = %v, want ErrNotOpen", tc.name, err)
 			}
@@ -296,14 +296,14 @@ func TestAddLineItemRejectedOnceBillLeavesOpen(t *testing.T) {
 func TestRetryOfAccruedItemIsHonouredAfterClose(t *testing.T) {
 	b := newOpenBill(t)
 	in := item("txn_1", 500, usd, "card fee")
-	if _, err := b.AddLineItem(in); err != nil {
+	if _, err := b.AddLineItem(in, ""); err != nil {
 		t.Fatalf("AddLineItem returned error: %v", err)
 	}
 	if _, err := b.Close(bill.TriggerPeriodEnd, periodEnd); err != nil {
 		t.Fatalf("Close returned error: %v", err)
 	}
 
-	got, err := b.AddLineItem(in)
+	got, err := b.AddLineItem(in, "")
 	if err != nil {
 		t.Fatalf("retry after close returned error: %v, want the accrued item", err)
 	}
@@ -324,7 +324,7 @@ func TestEveryDistinctLineItemIsRetained(t *testing.T) {
 	const n = 250
 	for i := 0; i < n; i++ {
 		id := "txn_" + time.Duration(i).String()
-		if _, err := b.AddLineItem(item(id, 10, usd, "fee")); err != nil {
+		if _, err := b.AddLineItem(item(id, 10, usd, "fee"), ""); err != nil {
 			t.Fatalf("AddLineItem %d returned error: %v", i, err)
 		}
 	}
@@ -344,7 +344,7 @@ func TestLineItemsListInAccrualOrder(t *testing.T) {
 	b := newOpenBill(t)
 	ids := []string{"txn_c", "txn_a", "txn_b", "txn_z", "txn_m"}
 	for _, id := range ids {
-		if _, err := b.AddLineItem(item(id, 10, usd, "fee")); err != nil {
+		if _, err := b.AddLineItem(item(id, 10, usd, "fee"), ""); err != nil {
 			t.Fatalf("AddLineItem returned error: %v", err)
 		}
 	}
@@ -364,7 +364,7 @@ func TestLineItemsListInAccrualOrder(t *testing.T) {
 func TestCloseFreezesTotalAndRecordsTrigger(t *testing.T) {
 	b := newOpenBill(t)
 	for i, amt := range []int64{1000, 200, 55} {
-		if _, err := b.AddLineItem(item("txn_"+string(rune('a'+i)), amt, usd, "fee")); err != nil {
+		if _, err := b.AddLineItem(item("txn_"+string(rune('a'+i)), amt, usd, "fee"), ""); err != nil {
 			t.Fatalf("AddLineItem returned error: %v", err)
 		}
 	}
@@ -417,7 +417,7 @@ func TestCloseWithNoLineItemsYieldsZeroTotal(t *testing.T) {
 // deadline".
 func TestCloseIsIdempotentAndReportsTheOriginalTrigger(t *testing.T) {
 	b := newOpenBill(t)
-	if _, err := b.AddLineItem(item("txn_1", 500, usd, "fee")); err != nil {
+	if _, err := b.AddLineItem(item("txn_1", 500, usd, "fee"), ""); err != nil {
 		t.Fatalf("AddLineItem returned error: %v", err)
 	}
 
@@ -476,7 +476,7 @@ func TestMarkInvoicedRejectsAnOpenBill(t *testing.T) {
 // snapshot's line items are a copy rather than a view onto the bill's own slice.
 func TestSnapshotIsUnaffectedByLaterMutation(t *testing.T) {
 	b := newOpenBill(t)
-	if _, err := b.AddLineItem(item("txn_1", 500, usd, "fee")); err != nil {
+	if _, err := b.AddLineItem(item("txn_1", 500, usd, "fee"), ""); err != nil {
 		t.Fatalf("AddLineItem returned error: %v", err)
 	}
 
@@ -486,7 +486,7 @@ func TestSnapshotIsUnaffectedByLaterMutation(t *testing.T) {
 	}
 
 	// Every mutation attempt available after a close.
-	_, _ = b.AddLineItem(item("txn_2", 9999, usd, "late fee"))
+	_, _ = b.AddLineItem(item("txn_2", 9999, usd, "late fee"), "")
 	_, _ = b.Close(bill.TriggerPeriodEnd, periodEnd.Add(time.Hour))
 	_ = b.MarkInvoiced()
 
@@ -562,7 +562,7 @@ func TestCheckAgainstSnapshot(t *testing.T) {
 	invoice := closedSnapshotWith(t, invoicedItem("txn_a", 500, "wire fee"))
 
 	t.Run("identical retry returns the accrued item", func(t *testing.T) {
-		got, err := bill.CheckAgainstSnapshot(invoice, invoicedItem("txn_a", 500, "wire fee"))
+		got, err := bill.CheckAgainstSnapshot(invoice, invoicedItem("txn_a", 500, "wire fee"), "")
 		if err != nil {
 			t.Fatalf("returned error: %v", err)
 		}
@@ -575,28 +575,28 @@ func TestCheckAgainstSnapshot(t *testing.T) {
 	})
 
 	t.Run("same id with a different amount conflicts", func(t *testing.T) {
-		_, err := bill.CheckAgainstSnapshot(invoice, invoicedItem("txn_a", 900, "wire fee"))
+		_, err := bill.CheckAgainstSnapshot(invoice, invoicedItem("txn_a", 900, "wire fee"), "")
 		if !errors.Is(err, bill.ErrLineItemConflict) {
 			t.Fatalf("error = %v, want ErrLineItemConflict", err)
 		}
 	})
 
 	t.Run("same id with a different description conflicts", func(t *testing.T) {
-		_, err := bill.CheckAgainstSnapshot(invoice, invoicedItem("txn_a", 500, "late fee"))
+		_, err := bill.CheckAgainstSnapshot(invoice, invoicedItem("txn_a", 500, "late fee"), "")
 		if !errors.Is(err, bill.ErrLineItemConflict) {
 			t.Fatalf("error = %v, want ErrLineItemConflict", err)
 		}
 	})
 
 	t.Run("a charge absent from the invoice arrived too late", func(t *testing.T) {
-		_, err := bill.CheckAgainstSnapshot(invoice, invoicedItem("txn_new", 700, "late fee"))
+		_, err := bill.CheckAgainstSnapshot(invoice, invoicedItem("txn_new", 700, "late fee"), "")
 		if !errors.Is(err, bill.ErrNotOpen) {
 			t.Fatalf("error = %v, want ErrNotOpen", err)
 		}
 	})
 
 	t.Run("missing detail is refused the same way the live path refuses it", func(t *testing.T) {
-		_, err := bill.CheckAgainstSnapshot(invoice, bill.LineItem{ID: "txn_x", Description: "no amount"})
+		_, err := bill.CheckAgainstSnapshot(invoice, bill.LineItem{ID: "txn_x", Description: "no amount"}, "")
 		if !errors.Is(err, bill.ErrInvalidLineItem) {
 			t.Fatalf("error = %v, want ErrInvalidLineItem", err)
 		}
@@ -613,7 +613,7 @@ func TestCheckAgainstSnapshotIgnoresAccrualTime(t *testing.T) {
 	retry := invoicedItem("txn_a", 500, "wire fee")
 	retry.AccruedAt = retry.AccruedAt.Add(90 * time.Second)
 
-	got, err := bill.CheckAgainstSnapshot(invoice, retry)
+	got, err := bill.CheckAgainstSnapshot(invoice, retry, "")
 	if err != nil {
 		t.Fatalf("a retry 90s later was refused: %v", err)
 	}
@@ -627,7 +627,7 @@ func TestCheckAgainstSnapshotIgnoresAccrualTime(t *testing.T) {
 func TestCheckAgainstSnapshotAgreesWithTheLivePath(t *testing.T) {
 	b := newOpenBill(t)
 	accrued := invoicedItem("txn_a", 500, "wire fee")
-	if _, err := b.AddLineItem(accrued); err != nil {
+	if _, err := b.AddLineItem(accrued, ""); err != nil {
 		t.Fatalf("accruing: %v", err)
 	}
 	if _, err := b.Close(bill.TriggerAPIRequest, time.Now()); err != nil {
@@ -636,22 +636,31 @@ func TestCheckAgainstSnapshotAgreesWithTheLivePath(t *testing.T) {
 	snap := b.Snapshot()
 
 	for _, tc := range []struct {
-		name string
-		item bill.LineItem
+		name   string
+		item   bill.LineItem
+		assert string
 	}{
-		{"identical retry", invoicedItem("txn_a", 500, "wire fee")},
-		{"conflicting reuse", invoicedItem("txn_a", 900, "wire fee")},
-		{"a new charge", invoicedItem("txn_b", 100, "late fee")},
+		{name: "identical retry", item: invoicedItem("txn_a", 500, "wire fee")},
+		{name: "conflicting reuse", item: invoicedItem("txn_a", 900, "wire fee")},
+		{name: "a new charge", item: invoicedItem("txn_b", 100, "late fee")},
+		// The assertion has to be exercised, or the two paths can order the
+		// customer check differently and the disagreement goes unseen - which is
+		// exactly what happened: storage checked it before the state, the live
+		// path after, so a closed bill answered 422 one way and 409 the other.
+		{name: "a new charge naming the wrong customer", item: invoicedItem("txn_c", 100, "late fee"), assert: "globex"},
+		{name: "a new charge naming the right customer", item: invoicedItem("txn_d", 100, "late fee"), assert: "acme"},
+		{name: "a retry naming the wrong customer", item: invoicedItem("txn_a", 500, "wire fee"), assert: "globex"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			_, liveErr := b.AddLineItem(tc.item)
-			_, snapErr := bill.CheckAgainstSnapshot(snap, tc.item)
+			_, liveErr := b.AddLineItem(tc.item, tc.assert)
+			_, snapErr := bill.CheckAgainstSnapshot(snap, tc.item, tc.assert)
 
 			switch {
 			case liveErr == nil && snapErr == nil:
 			case liveErr == nil || snapErr == nil:
 				t.Fatalf("live path returned %v but storage path returned %v", liveErr, snapErr)
 			case errors.Is(liveErr, bill.ErrLineItemConflict) != errors.Is(snapErr, bill.ErrLineItemConflict),
+				errors.Is(liveErr, bill.ErrCustomerMismatch) != errors.Is(snapErr, bill.ErrCustomerMismatch),
 				errors.Is(liveErr, bill.ErrNotOpen) != errors.Is(snapErr, bill.ErrNotOpen):
 				t.Fatalf("live path returned %v but storage path returned %v", liveErr, snapErr)
 			}
