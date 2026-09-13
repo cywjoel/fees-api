@@ -9,46 +9,22 @@ import (
 	"fees-api/internal/money"
 )
 
-// Rejection reasons. These are the workflow's machine-readable vocabulary for
-// refusing an update, and they cross the process boundary intact.
-//
-// A domain error's Go identity does not survive the trip from worker to API
-// caller - errors.Is cannot match across a serialised Temporal failure - so each
-// rejection carries one of these as its application-error type. The API layer
-// maps them to status codes, which keeps the mapping in one place and stops the
-// caller having to match on message text.
+// Rejection reasons are the workflow's machine-readable vocabulary for refusing
+// an update. A domain error's Go identity does not survive the trip from worker
+// to API caller - errors.Is cannot match across a serialised Temporal failure -
+// so each rejection carries one of these as its application-error type. The API
+// layer maps them to status codes in one place; see reasonStatus in the billing
+// package.
 const (
-	// ReasonBillNotOpen means a new charge was offered to a bill whose totals are
-	// already frozen. A contradiction: 409.
-	ReasonBillNotOpen = "bill_not_open"
-
-	// ReasonLineItemConflict means an item id already on the bill was reused with
-	// different detail. Also a contradiction: 409.
-	ReasonLineItemConflict = "line_item_conflict"
-
-	// ReasonCurrencyMismatch means the line item is denominated differently from
-	// the bill. Malformed rather than contradictory: 422.
-	ReasonCurrencyMismatch = "currency_mismatch"
-
-	// ReasonCustomerMismatch means the line item states a customer that is not
-	// the bill's. Like a currency mismatch it is malformed rather than
-	// contradictory: 422.
-	ReasonCustomerMismatch = "customer_mismatch"
-
-	// ReasonInvalidLineItem means the line item is missing required detail: 422.
-	ReasonInvalidLineItem = "invalid_line_item"
-
-	// ReasonInvalidPeriod means the fee period does not end after it begins: 422.
-	ReasonInvalidPeriod = "invalid_period"
-
-	// ReasonUnsupportedCurrency means the currency is outside the supported set: 422.
+	ReasonBillNotOpen         = "bill_not_open"
+	ReasonLineItemConflict    = "line_item_conflict"
+	ReasonCurrencyMismatch    = "currency_mismatch"
+	ReasonCustomerMismatch    = "customer_mismatch"
+	ReasonInvalidLineItem     = "invalid_line_item"
+	ReasonInvalidPeriod       = "invalid_period"
 	ReasonUnsupportedCurrency = "unsupported_currency"
-
-	// ReasonInvalidBill means the bill is missing required detail: 422.
-	ReasonInvalidBill = "invalid_bill"
-
-	// ReasonInternal is the fallback for an error with no domain meaning: 500.
-	ReasonInternal = "internal"
+	ReasonInvalidBill         = "invalid_bill"
+	ReasonInternal            = "internal"
 )
 
 // ClassifyRejection maps a domain error to its machine-readable reason.

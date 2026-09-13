@@ -1,12 +1,8 @@
 // Package bill holds the fee-bill domain: its lifecycle state machine, the
 // aggregate that accrues line items, and the frozen invoice a close produces.
 //
-// Nothing here imports Temporal or Encore. The lifecycle rules are pure
-// functions over in-memory state, so they can be exercised directly by unit
-// tests; the workflow in the billing service drives this domain rather than
-// reimplementing it. A transition that is only reachable by executing a workflow
-// is needlessly hard to test, and correctness of the state machine is the part
-// most worth testing cheaply.
+// Nothing here imports Temporal or Encore, so the lifecycle rules are pure
+// functions over in-memory state and can be tested without running a workflow.
 package bill
 
 import (
@@ -35,16 +31,12 @@ import (
 type State string
 
 const (
-	// StateOpen accepts line items.
 	StateOpen State = "OPEN"
 
-	// StateClosing has a frozen total and line item collection and a pending
-	// invoice hand-off. It exists because that hand-off can fail and be
-	// retried: the totals must be final before it starts, but the bill is not
-	// yet done.
+	// StateClosing exists because the invoice hand-off can fail and be retried:
+	// the totals must be final before it starts, but the bill is not yet done.
 	StateClosing State = "CLOSING"
 
-	// StateClosed is terminal and immutable.
 	StateClosed State = "CLOSED"
 )
 
@@ -52,11 +44,7 @@ const (
 type Event string
 
 const (
-	// EventClose freezes the bill's totals: OPEN -> CLOSING.
-	EventClose Event = "CLOSE"
-
-	// EventInvoiced records that the invoice hand-off succeeded:
-	// CLOSING -> CLOSED.
+	EventClose    Event = "CLOSE"
 	EventInvoiced Event = "INVOICED"
 )
 
@@ -66,11 +54,8 @@ const (
 type Trigger string
 
 const (
-	// TriggerAPIRequest means an explicit close request closed the bill.
 	TriggerAPIRequest Trigger = "api_request"
-
-	// TriggerPeriodEnd means the fee period's deadline closed the bill.
-	TriggerPeriodEnd Trigger = "period_end"
+	TriggerPeriodEnd  Trigger = "period_end"
 )
 
 // ErrInvalidTransition is returned when an event cannot be applied to a state.
@@ -90,9 +75,6 @@ var transitions = map[State]map[Event]State{
 }
 
 // Transition applies e to s and returns the resulting state.
-//
-// It is a pure function: the whole lifecycle rule set is one table lookup, with
-// no dependency on time, storage, or the workflow that ordinarily drives it.
 func Transition(s State, e Event) (State, error) {
 	byEvent, ok := transitions[s]
 	if !ok {
@@ -108,6 +90,5 @@ func Transition(s State, e Event) (State, error) {
 // IsTerminal reports whether no further transition is possible from s.
 func IsTerminal(s State) bool { return len(transitions[s]) == 0 }
 
-// AcceptsLineItems reports whether a bill in s may still accrue charges. Only an
-// open bill may: once totals are frozen, no further charge may join them.
+// AcceptsLineItems reports whether a bill in s may still accrue charges.
 func AcceptsLineItems(s State) bool { return s == StateOpen }

@@ -25,26 +25,18 @@ import (
 	"fees-api/internal/money"
 )
 
-// temporalCallTimeout bounds how long an API request waits on Temporal before
-// answering the caller.
-//
-// Without it the SDK retries a transient failure against the request's own
-// context, which has no deadline, so an outage leaves a mutation hanging rather
-// than refusing it - the caller learns nothing and holds a connection open until
-// it gives up. A bounded wait turns that into a 503 the caller can act on.
-//
-// Timing out is safe here precisely because every mutation is idempotent: an
-// update that did apply before the deadline is recognised as already applied when
-// the caller retries, so a premature 503 cannot double-charge a bill.
+// temporalCallTimeout bounds how long an API request waits on Temporal. Without
+// it the SDK retries against the request's own deadline-free context, so an
+// outage leaves a mutation hanging rather than refusing it. Timing out is safe
+// because every mutation is idempotent: a premature 503 cannot double-charge.
 const temporalCallTimeout = 10 * time.Second
 
-// temporalContext bounds a Temporal call to temporalCallTimeout, while still
-// cancelling if the client disconnects first.
+// temporalContext bounds a Temporal call, while still cancelling if the client
+// disconnects first.
 func temporalContext(req *http.Request) (context.Context, context.CancelFunc) {
 	return context.WithTimeout(req.Context(), temporalCallTimeout)
 }
 
-// CreateBillRequest opens a bill for a fee period.
 type CreateBillRequest struct {
 	CustomerID  string    `json:"customerId"`
 	Currency    string    `json:"currency"`
@@ -55,52 +47,29 @@ type CreateBillRequest struct {
 // AddLineItemRequest accrues one charge. The item's identifier is the path
 // segment, not a body field: it identifies the resource being created.
 type AddLineItemRequest struct {
-	// CustomerID is optional. When present it must be the bill's customer.
-	//
-	// A checksum rather than an identity claim: the caller already chose the bill
-	// by its id, so this states what the caller believes and lets the system
-	// disagree. Optional because requiring it would force every caller to carry
-	// the customer alongside the bill id for a guarantee only some of them need.
+	// Optional, and a checksum rather than an identity claim: the caller already
+	// chose the bill by its id, so this states what the caller believes and lets
+	// the system disagree.
 	CustomerID  string      `json:"customerId,omitempty"`
 	Amount      money.Money `json:"amount"`
 	Description string      `json:"description"`
 }
 
 // matchesRequest reports whether an existing bill is the one this request asked
-// for. It is the check that makes an idempotency key safe to reuse by accident:
-// without it, a key reused with different parameters is answered with a bill in
-// the wrong currency, for the wrong period, and the caller is never told.
-//
-// Nothing needs to be stored to do this. The request is exactly a currency and a
-// fee period, and a bill carries all three, so the bill is its own record of what
-// was asked for - which keeps uniqueness coming from Temporal rather than from a
-// deduplication table.
-//
-// Instants are compared with Equal, never ==. The period comes back from the
-// workflow as UTC while a caller may have written the same moment with an offset;
-// == compares wall clock, location and monotonic reading, so it would refuse a
-// correct retry.
-//
-// Both sides are taken to storage precision first. A bill read back from Postgres
-// has lost its sub-microsecond digits, and comparing that against an untruncated
-// request refused a correct retry as key reuse - the same false 409 the Equal
-// rule above exists to prevent, arriving by a different route. Requests are
-// truncated on the way in too, so this is belt and braces for bills created
-// before that was so.
+// for, which is what makes an accidentally reused idempotency key safe.
 func matchesRequest(snap bill.Snapshot, currency money.Currency, in CreateBillRequest) bool {
+	// Equal, never ==, which would also compare location and monotonic reading;
+	// and both sides at storage precision, since a bill read back from Postgres
+	// has lost its sub-microsecond digits. Each caused a false 409 by its absence.
 	return snap.Currency.Code == currency.Code &&
 		atStoragePrecision(snap.PeriodStart).Equal(atStoragePrecision(in.PeriodStart)) &&
 		atStoragePrecision(snap.PeriodEnd).Equal(atStoragePrecision(in.PeriodEnd))
 }
 
 // writeKeyReuse refuses a key that already named a different bill.
-//
-// The existing bill's currency and fee period are deliberately not echoed, for
-// the same reason the customer is not named on a mismatch: an error that reports
-// another request's parameters back to whoever asks is a read endpoint wearing a
-// 409. The caller is told its key is already spoken for and what to do about it,
-// which is all it can act on.
 func writeKeyReuse(w http.ResponseWriter, billID string, snap bill.Snapshot) {
+	// Deliberately unread: echoing the existing bill's currency and period would
+	// make this a read endpoint wearing a 409.
 	_ = snap
 	writeProblem(w, http.StatusConflict, reasonKeyReuse,
 		"this idempotency key already created bill "+billID+" with different parameters; "+
@@ -108,15 +77,11 @@ func writeKeyReuse(w http.ResponseWriter, billID string, snap bill.Snapshot) {
 }
 
 // validateLineItemRequest reports what is wrong with a charge before it is sent
-// anywhere, or nil if it is well formed.
+// anywhere.
 //
-// It exists because an absent amount is not caught by decoding. A body with no
-// amount leaves the zero Money, whose currency is empty; that marshals happily
-// onto the update payload and then fails to deserialise on the worker, so the
-// validator never runs and the caller is told the service broke rather than that
-// its request was malformed.
-//
-// Pure, so the rule is testable without a running workflow or a live request.
+// It exists because an absent amount survives decoding: the zero Money marshals
+// onto the update payload and fails on the worker, so the caller is told the
+// service broke rather than that its request was malformed.
 func validateLineItemRequest(itemID string, in AddLineItemRequest) error {
 	if itemID == "" {
 		return fmt.Errorf("%w: item id is required", bill.ErrInvalidLineItem)
@@ -132,16 +97,9 @@ func validateLineItemRequest(itemID string, in AddLineItemRequest) error {
 
 // CreateBill opens a new bill and starts the workflow that owns it.
 //
-// Creation is idempotent through the Idempotency-Key header, which is mapped
-// deterministically onto the workflow id. Uniqueness then comes from Temporal
-// itself rather than from a deduplication table: the same key can only ever name
-// one workflow execution.
-//
-// Two policies make that work, and both are load-bearing. Without
-// REJECT_DUPLICATE, the default reuse policy would let a repeated request start a
-// brand new run under the same id once the first bill had closed - a second bill,
-// created silently, with no error anywhere. USE_EXISTING returns the running
-// execution instead of failing when the bill is still open.
+// Idempotent through the Idempotency-Key header, mapped deterministically onto
+// the workflow id, so uniqueness comes from Temporal rather than from a
+// deduplication table.
 //
 //encore:api public raw method=POST path=/bills
 func (s *Service) CreateBill(w http.ResponseWriter, req *http.Request) {
@@ -157,13 +115,10 @@ func (s *Service) CreateBill(w http.ResponseWriter, req *http.Request) {
 
 	if strings.TrimSpace(in.CustomerID) == "" {
 		// Required here and not in the domain: bill.New must tolerate an empty
-		// customer so that histories recorded before this field existed still
-		// replay. This is the one place the requirement can be enforced without
-		// stranding a bill that is already running.
-		// Trimmed for the test, stored as given. A value that is only whitespace
-		// identifies nobody, and accepting it defeats the point of requiring the
-		// field at all - but an identifier that meaningfully carries surrounding
-		// whitespace is still kept exactly as sent, because it is opaque.
+		// customer so old histories still replay; see bill.New.
+		//
+		// Trimmed for the test, stored as given. Whitespace-only identifies nobody,
+		// but an identifier that meaningfully carries padding is kept as sent.
 		writeProblem(w, http.StatusUnprocessableEntity, billflow.ReasonInvalidBill,
 			"customerId is required and cannot be blank; a bill exists to be invoiced to someone")
 		return
@@ -176,9 +131,8 @@ func (s *Service) CreateBill(w http.ResponseWriter, req *http.Request) {
 		return
 	}
 	// Before validation, not after: two instants less than a microsecond apart
-	// would otherwise satisfy "strictly after" and then collapse into one another
-	// on the way to storage, leaving a bill whose period does not end after it
-	// begins - which the invoice table's own CHECK constraint forbids.
+	// would otherwise satisfy "strictly after" and then collapse on the way to
+	// storage, which the invoice table's CHECK constraint forbids.
 	in.PeriodStart = atStoragePrecision(in.PeriodStart)
 	in.PeriodEnd = atStoragePrecision(in.PeriodEnd)
 
@@ -188,10 +142,8 @@ func (s *Service) CreateBill(w http.ResponseWriter, req *http.Request) {
 		return
 	}
 	if !in.PeriodEnd.After(time.Now()) {
-		// A bill accrues charges over a period that is still running. One whose
-		// period has ended builds a timer with a negative duration, fires it at
-		// once, and is closing before the caller has read the response saying it
-		// was created - a 201 for a bill that can never take a charge.
+		// A period already ended builds a timer with a negative duration and closes
+		// before the caller has read the 201 - a bill that can never take a charge.
 		writeProblem(w, http.StatusUnprocessableEntity, billflow.ReasonInvalidPeriod,
 			"periodEnd is in the past; a bill cannot accrue charges over a period that has already ended")
 		return
@@ -294,16 +246,10 @@ func (s *Service) CreateBill(w http.ResponseWriter, req *http.Request) {
 // startBillWorkflow starts a bill's workflow and reports whether this request is
 // the one that created it.
 //
-// It calls the service API directly rather than client.ExecuteWorkflow, because
-// the SDK helper does not surface that fact. Under any conflict policy it returns
-// the existing run handle and a nil error when the workflow is already running,
-// so a caller cannot tell creating from attaching - and every concurrent request
-// sharing an idempotency key then reports 201 Created. The raw response carries a
-// Started flag, which is exactly the missing signal.
-//
-// USE_EXISTING rather than FAIL: attaching is the ordinary outcome of a retry and
-// should not be an error path. REJECT_DUPLICATE still stands, so a key whose bill
-// has completed cannot quietly start a second one.
+// It calls the service API directly rather than client.ExecuteWorkflow because
+// the SDK helper cannot report that: under any conflict policy it returns the
+// existing run handle and a nil error, so every concurrent request sharing a key
+// reports 201. The raw response's Started flag is the missing signal.
 func (s *Service) startBillWorkflow(ctx context.Context, billID string, in billflow.StartBillInput) (bool, error) {
 	payload, err := dataConverter.ToPayloads(in)
 	if err != nil {
@@ -320,7 +266,10 @@ func (s *Service) startBillWorkflow(ctx context.Context, billID string, in billf
 			// Identifies this attempt. Distinct per request, so two concurrent
 			// requests are two attempts and exactly one of them starts the bill; a
 			// shared value would make the server treat them as one retried request.
-			RequestId:                newRequestID(),
+			RequestId: newRequestID(),
+			// REJECT_DUPLICATE: without it a repeated key would silently start a
+			// second bill once the first had closed. USE_EXISTING: attaching is the
+			// ordinary outcome of a retry, not an error path.
 			WorkflowIdReusePolicy:    enumspb.WORKFLOW_ID_REUSE_POLICY_REJECT_DUPLICATE,
 			WorkflowIdConflictPolicy: enumspb.WORKFLOW_ID_CONFLICT_POLICY_USE_EXISTING,
 		})
@@ -337,24 +286,8 @@ func newRequestID() string {
 	return hex.EncodeToString(b[:])
 }
 
-// AddLineItem accrues a charge onto an open bill.
-//
-// PUT rather than POST, because the caller supplies the item's identifier and the
-// operation is idempotent - which is what PUT means in RFC 9110. The identifier
-// is not a retry token bolted onto the request: a fee is caused by something that
-// already has an identity, so keying on it expresses a real invariant, that the
-// fee for a given source event appears at most once on this bill.
-//
-// The item id is deliberately *not* used as the Temporal update id, despite the
-// temptation: Temporal deduplicates by update id before the validator runs, so a
-// second request reusing an item id with a different amount would be answered
-// from the first result and the conflict would never be detected. The bill would
-// be correct - the stored item is never overwritten - but the caller would be
-// told its charge was accepted when a contradictory one was silently ignored.
-//
-// Deduplication therefore belongs to the domain, which distinguishes an identical
-// retry from a conflicting reuse. Updates are delivered at least once and the
-// handler is idempotent, so nothing is lost by letting each request through.
+// AddLineItem accrues a charge onto an open bill, keyed by a caller-supplied
+// item id.
 //
 //encore:api public raw method=PUT path=/bills/:billId/line-items/:itemId
 func (s *Service) AddLineItem(w http.ResponseWriter, req *http.Request) {
@@ -375,6 +308,11 @@ func (s *Service) AddLineItem(w http.ResponseWriter, req *http.Request) {
 		return
 	}
 
+	// No UpdateID, deliberately: the item id is the obvious candidate and would be
+	// wrong. Temporal deduplicates by update id before the validator runs, so a
+	// second request reusing an item id with a different amount would be answered
+	// from the first result and the conflict never detected. Deduplication belongs
+	// to the domain, which can tell a retry from a contradiction.
 	handle, err := s.temporal.UpdateWorkflow(ctx, client.UpdateWorkflowOptions{
 		WorkflowID:   billID,
 		UpdateName:   billflow.UpdateAddLineItem,
@@ -411,14 +349,9 @@ func (s *Service) AddLineItem(w http.ResponseWriter, req *http.Request) {
 
 // CloseBill freezes a bill's totals and starts the invoice hand-off.
 //
-// The response is 202, not 200: the totals are final, but the bill is not. It
-// carries the frozen total and every line item charged, so the caller gets the
-// invoice in the same round trip that requests it.
-//
-// Closing a bill that is already closing or closed is not an error. The caller
-// wanted the bill closed and it is; the response reports closedBy, so a request
-// that lost the race against the period-end deadline can tell that the deadline
-// closed it rather than being handed a failure for a state it asked for.
+// 202, not 200: the totals are final, the bill is not. Closing an already-closed
+// bill is not an error - the response reports closedBy, so a request that lost
+// the race against the period-end deadline can tell what closed it.
 //
 //encore:api public raw method=POST path=/bills/:billId/close
 func (s *Service) CloseBill(w http.ResponseWriter, req *http.Request) {
@@ -469,13 +402,8 @@ func (s *Service) CloseBill(w http.ResponseWriter, req *http.Request) {
 	s.writeUpdateFailure(w, billID, err)
 }
 
-// GetBill returns a bill in any state.
-//
-// While the bill is open its live state comes from the workflow, which is the
-// authoritative writer and answers with strong consistency. Once the workflow has
-// finished, the invoice is read from storage - which is the point of persisting
-// it, since workflow history is retained for a limited window and a financial
-// artifact must outlive the process that produced it.
+// GetBill returns a bill in any state: live from the workflow while it is open,
+// from the persisted invoice once the workflow has finished.
 //
 //encore:api public raw method=GET path=/bills/:billId
 func (s *Service) GetBill(w http.ResponseWriter, req *http.Request) {
@@ -540,17 +468,13 @@ func (s *Service) writeUpdateFailure(w http.ResponseWriter, billID string, err e
 	}
 }
 
-// writeAddFailure answers a charge the workflow could not take.
+// writeAddFailure answers a charge the workflow could not take, consulting the
+// persisted invoice when there is no live execution.
 //
-// A bill's workflow finishes within seconds of the bill closing, and stays
-// finished for the rest of the bill's life - so "no live execution" is the
-// ordinary condition of a closed bill, not an exotic one. Treating it as a
-// missing bill answered 404 for a charge on a bill that GET returns 200 for, and
+// That is the ordinary condition of a closed bill, not an exotic one: treating it
+// as a missing bill answered 404 for a charge on a bill GET returns 200 for, and
 // a caller told its charge was refused as unknown may compensate for money that
 // is genuinely on the invoice.
-//
-// So the persisted invoice is consulted, exactly as CloseBill already does, and
-// the answer comes from the same domain rule the live path applies.
 func (s *Service) writeAddFailure(w http.ResponseWriter, ctx context.Context, billID, itemID string, in AddLineItemRequest, err error) {
 	if !isWorkflowAbsent(err) {
 		s.writeUpdateFailure(w, billID, err)
@@ -588,9 +512,8 @@ func (s *Service) writeAddFailure(w http.ResponseWriter, ctx context.Context, bi
 	})
 }
 
-// statusForDomainError maps a domain error to its status using the same table
-// the workflow's rejections go through, so a charge refused from storage and the
-// same charge refused by the workflow answer identically.
+// statusForDomainError maps a domain error to its status through the same table
+// the workflow's rejections use, so storage and the workflow answer identically.
 func statusForDomainError(err error) int {
 	if status, ok := reasonStatus[billflow.ClassifyRejection(err)]; ok {
 		return status
@@ -607,32 +530,26 @@ func pathParam(name string) string {
 }
 
 // billIDFor derives a bill id from an idempotency key, or generates one when no
-// key was supplied. The second return reports whether the id came from a key and
-// is therefore reproducible by a retry.
-//
-// The key is hashed rather than used directly so that an arbitrary client string
-// cannot become a workflow id with whatever characters and length it happens to
-// carry.
+// key was supplied; the second return reports whether the id is reproducible by a
+// retry.
 func billIDFor(idempotencyKey string) (string, bool) {
 	if idempotencyKey == "" {
 		var b [16]byte
 		_, _ = rand.Read(b[:])
 		return "bill_" + hex.EncodeToString(b[:]), false
 	}
+	// Hashed so an arbitrary client string cannot become a workflow id with
+	// whatever characters and length it happens to carry.
 	sum := sha256.Sum256([]byte(idempotencyKey))
 	return "bill_" + hex.EncodeToString(sum[:])[:32], true
 }
 
-// billIDForCustomer derives a bill id from the customer and its idempotency key.
+// billIDForCustomer scopes the key to its customer, so it identifies a request
+// within one rather than across all of them. Hashed globally, "september-2026"
+// named one bill for every caller.
 //
-// The key identifies a request within a customer rather than across all of them.
-// Hashed globally, "september-2026" named one bill for every caller, so two fee
-// engines acting for different customers were handed the same bill and the
-// second accrued its charges onto the first customer's invoice.
-//
-// The boundary between the two fields is encoded, not marked. A customer
-// identifier is opaque, so no character can be reserved as a delimiter, and every
-// naive scheme has a colliding pair:
+// The boundary is encoded, not marked: the identifier is opaque, so no character
+// can be reserved as a delimiter, and every naive scheme has a colliding pair:
 //
 //	customer + key         ("acme","x") and ("acm","ex")   -> "acmex"
 //	customer + ":" + key   ("ac:me","x") and ("ac","me:x") -> "ac:me:x"
@@ -647,7 +564,6 @@ func billIDForCustomer(customerID, idempotencyKey string) (string, bool) {
 	return billIDFor(scoped)
 }
 
-// joinCodes renders supported currency codes for an error message.
 func joinCodes(codes []string) string {
 	out := ""
 	for i, c := range codes {

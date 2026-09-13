@@ -24,17 +24,13 @@ var yieldPoints = map[string]bool{
 // TestUpdateHandlersAreYieldFree enforces the rule the whole close-race design
 // rests on.
 //
-// Update handlers and the workflow's main loop run on the same thread and
-// interleave only at yield points. A handler containing no yield point is
-// therefore atomic with respect to the period-end timer, and the race between an
-// early close and the deadline resolves without a lock: whichever trigger
-// reaches the state first wins, and the loser is a no-op reading the same
-// variable on the same thread.
+// Handlers and the main loop share a thread and interleave only at yield points,
+// so a handler with no yield point is atomic with respect to the period-end timer
+// and the close race resolves without a lock. A handler that awaited an activity
+// would suspend mid-transition and let the timer fire inside that window.
 //
-// Were a handler to call an activity, it would suspend mid-transition and the
-// timer could fire inside that window, leaving a bill half-closed. That is a
-// defect no runtime assertion would catch reliably - it depends on timing - so
-// it is checked structurally instead, against the source itself.
+// Timing-dependent, so no runtime assertion catches it reliably; checked
+// structurally against the source instead.
 func TestUpdateHandlersAreYieldFree(t *testing.T) {
 	fset := token.NewFileSet()
 	file, err := parser.ParseFile(fset, "workflow.go", nil, 0)

@@ -4,13 +4,10 @@ package billing
 
 import "context"
 
-// HealthResponse reports service liveness.
 type HealthResponse struct {
 	Status string `json:"status"`
 }
 
-// Health reports whether the service is up.
-//
 //encore:api public method=GET path=/health
 func Health(ctx context.Context) (*HealthResponse, error) {
 	return &HealthResponse{Status: "ok"}, nil

@@ -1,25 +1,16 @@
 // Package billflow contains the Temporal workflow that owns a bill for the
 // duration of its fee period.
 //
-// One workflow execution corresponds to exactly one bill, and the workflow is
-// the authoritative writer for that bill while it is open. This is what Temporal
-// is here for, and the reasons are specific:
+// One workflow execution is one bill, and the workflow is the authoritative
+// writer for that bill while it is open. Temporal is here for four specific
+// things: serialised writes (a workflow is a single-threaded deterministic
+// coroutine scheduler, so concurrent additions to one bill are ordered by
+// construction - no row lock, no lost update), a durable month-long deadline
+// that survives restarts and deploys, a retrying invoice hand-off so a transient
+// downstream failure does not lose the close, and a replayable audit trail.
 //
-//   - Serialised writes. A workflow executes as a single-threaded deterministic
-//     coroutine scheduler, so concurrent line-item additions to one bill are
-//     ordered by construction. There is no row lock, no optimistic-concurrency
-//     retry loop, and no lost update to defend against.
-//   - A durable deadline. A fee period may run for a month. The period-end timer
-//     survives process restarts, deploys, and crashes.
-//   - Reliable hand-off. The invoice emission at the end of the period is an
-//     activity with a retry policy, so a transient downstream failure does not
-//     lose the close.
-//   - A replayable audit trail. The workflow's history is an ordered record of
-//     every charge and every state change.
-//
-// The package deliberately does not import Encore. It depends on the domain in
-// internal/bill and on the Temporal SDK, so the lifecycle can be exercised in
-// tests without any infrastructure.
+// The package deliberately does not import Encore, so the lifecycle can be
+// exercised in tests without any infrastructure.
 package billflow
 
 import (
@@ -32,57 +23,43 @@ import (
 	"fees-api/internal/money"
 )
 
-// TaskQueue is the queue the bill workflow and its activities run on.
 const TaskQueue = "fees-api-bills"
 
-// WorkflowTypeName is the name the bill workflow is registered under, and the
-// name a start request must ask for.
-//
-// It is a constant because bill creation starts the workflow through the raw
-// service API rather than the SDK helper, and so has to name the type itself.
-// Registration uses this same constant, so the two cannot drift - and it matches
-// the type recorded in the committed replay fixtures, which must keep replaying.
+// WorkflowTypeName is the name the workflow is registered under and the name a
+// start request must ask for. It is a constant because bill creation starts the
+// workflow through the raw service API rather than the SDK helper, so the two
+// cannot drift - and it matches the type recorded in the committed replay
+// fixtures, which must keep replaying.
 const WorkflowTypeName = "BillWorkflow"
 
-// Update, query, and activity names. They are part of the workflow's contract
-// with its callers and its worker, so they are named constants rather than
-// literals scattered across the codebase.
+// Update, query, and activity names: part of the workflow's contract with its
+// callers and its worker.
 const (
-	// UpdateAddLineItem accrues a charge onto the bill.
 	UpdateAddLineItem = "addLineItem"
+	UpdateCloseBill   = "closeBill"
+	QueryGetBill      = "getBill"
 
-	// UpdateCloseBill closes the bill early, before its period ends.
-	UpdateCloseBill = "closeBill"
-
-	// QueryGetBill reads the bill's live state.
-	QueryGetBill = "getBill"
-
-	// ActivityPersistInvoice writes the frozen invoice to durable storage.
 	ActivityPersistInvoice = "PersistInvoice"
 
 	// ActivityEmitInvoice hands the invoice to the payee. Its implementation is
 	// out of scope for this service; the seam and its retry behaviour are not.
 	ActivityEmitInvoice = "EmitInvoice"
 
-	// ActivityFinalizeInvoice records that the hand-off completed.
 	ActivityFinalizeInvoice = "FinalizeInvoice"
 )
 
 // StartBillInput opens a bill for a fee period.
 //
-// The period bounds are supplied by the caller rather than derived from a
-// billing calendar here. That keeps calendar policy out of this service, and it
-// makes the timer path demonstrable: a reviewer can set PeriodEnd seconds away
-// and watch the bill close, which a hard-coded month would make impossible to
-// exercise by hand.
+// The period bounds come from the caller rather than a billing calendar here,
+// which keeps calendar policy out of this service and makes the timer path
+// demonstrable: a reviewer can set PeriodEnd seconds away and watch the bill
+// close.
 type StartBillInput struct {
 	BillID string `json:"billId"`
 
-	// CustomerID is the customer the bill belongs to.
-	//
 	// A history recorded before this field existed decodes it as empty, and the
-	// workflow must not branch on that: see bill.New. The requirement that a
-	// customer be supplied is enforced at the API boundary instead.
+	// workflow must not branch on that: see bill.New. The requirement is enforced
+	// at the API boundary instead.
 	CustomerID string `json:"customerId"`
 
 	Currency    string    `json:"currency"`
@@ -90,33 +67,29 @@ type StartBillInput struct {
 	PeriodEnd   time.Time `json:"periodEnd"`
 }
 
-// AddLineItemInput accrues one charge.
 type AddLineItemInput struct {
 	ItemID string `json:"itemId"`
 
-	// CustomerID is what the caller believes the bill's customer to be, or empty
-	// when it did not say. Compared in the validator, never stored.
-	//
-	// A history recorded before this field existed decodes it as empty, and an
-	// empty assertion is deliberately not a mismatch - treating absence as
-	// disagreement would branch on it and break replay.
+	// What the caller believes the bill's customer to be, or empty when it did
+	// not say. Compared in the validator, never stored. An empty assertion is
+	// deliberately not a mismatch: an old history decodes it as empty, and
+	// treating absence as disagreement would branch on it and break replay.
 	CustomerID string `json:"customerId,omitempty"`
 
 	Amount      money.Money `json:"amount"`
 	Description string      `json:"description"`
 }
 
-// CloseBillInput requests an early close. It carries no fields today; it exists
-// so the update has a stable shape to grow into.
+// CloseBillInput carries no fields today; it exists so the update has a stable
+// shape to grow into.
 type CloseBillInput struct{}
 
-// FinalizeInvoiceInput records a bill's terminal state in durable storage.
 type FinalizeInvoiceInput struct {
 	BillID string     `json:"billId"`
 	State  bill.State `json:"state"`
 }
 
-// persistOptions govern the durable write. The invoice must be recorded, so this
+// persistOptions govern the durable write: the invoice must be recorded, so this
 // retries patiently.
 func persistOptions() workflow.ActivityOptions {
 	return workflow.ActivityOptions{
@@ -130,9 +103,8 @@ func persistOptions() workflow.ActivityOptions {
 	}
 }
 
-// emitOptions govern the invoice hand-off. Attempts are bounded: a hand-off that
-// keeps failing leaves the bill visibly in CLOSING rather than retrying forever
-// in silence, which is the state an operator should be alerted on.
+// emitOptions bound the hand-off attempts: one that keeps failing leaves the bill
+// visibly in CLOSING rather than retrying forever in silence.
 func emitOptions() workflow.ActivityOptions {
 	return workflow.ActivityOptions{
 		StartToCloseTimeout: 30 * time.Second,
@@ -148,18 +120,12 @@ func emitOptions() workflow.ActivityOptions {
 // BillWorkflow owns one bill from the start of its fee period to the moment its
 // invoice has been handed off.
 //
-// The shape of the body matters as much as its behaviour. Update handlers are
-// yield-free: they validate, mutate in memory, and return. All waiting - the
-// period timer, the activity calls - happens in the main loop below. Because
-// handlers and the main loop run on the same thread and interleave only at yield
-// points, a handler containing no yield point is atomic with respect to the
-// timer. That is what makes the close race resolvable without a lock: whichever
-// trigger reaches the state first wins, and the loser is a no-op reading the
-// same variable on the same thread.
-//
-// Were the close handler to call an activity itself, it would yield mid-
-// transition and the timer could fire inside that window, producing a bill that
-// is half-closed. It does not; the main loop runs the activities afterwards.
+// Its update handlers must stay yield-free: they validate, mutate in memory, and
+// return, while all waiting happens in the main loop. Handlers and the main loop
+// share a thread and interleave only at yield points, so a handler with no yield
+// point is atomic with respect to the timer - which is what resolves the close
+// race without a lock. A handler that awaited an activity would yield
+// mid-transition and let the timer fire inside that window.
 func BillWorkflow(ctx workflow.Context, in StartBillInput) (bill.Snapshot, error) {
 	logger := workflow.GetLogger(ctx)
 
@@ -175,23 +141,20 @@ func BillWorkflow(ctx workflow.Context, in StartBillInput) (bill.Snapshot, error
 			err.Error(), ClassifyRejection(err), err)
 	}
 
-	// closeRequested lets an early close wake the main loop. The settable is
-	// resolved by the close handler, which is why the handler can stay yield-free
-	// while still ending the wait.
+	// closeRequested lets an early close wake the main loop, which is how the
+	// close handler ends the wait while staying yield-free.
 	closeRequested, requestClose := workflow.NewFuture(ctx)
 	closeSignalled := false
 
-	// beginClose is the single place the bill's state changes to CLOSING. Both
-	// triggers route through it, and it is a no-op once the bill has left OPEN,
-	// so whichever arrives second changes nothing.
+	// beginClose is the single place the state changes to CLOSING. Both triggers
+	// route through it, and it is a no-op once the bill has left OPEN, so
+	// whichever arrives second changes nothing.
 	beginClose := func(trigger bill.Trigger) (bill.Snapshot, error) {
 		snap, closeErr := b.Close(trigger, workflow.Now(ctx))
 		if closeErr != nil {
-			// Unreachable today: Close errors only on a transition the state table
-			// forbids, and it cannot be reached from OPEN. Returned rather than
-			// logged all the same, because swallowing it answered 202 Accepted with
-			// a snapshot still reading OPEN - telling a caller its bill was closing
-			// when nothing had happened.
+			// Unreachable today, but returned rather than logged: swallowing it
+			// answered 202 with a snapshot still reading OPEN, telling a caller its
+			// bill was closing when nothing had happened.
 			logger.Error("closing bill failed", "billID", b.ID(), "error", closeErr)
 			return bill.Snapshot{}, closeErr
 		}
@@ -212,8 +175,6 @@ func BillWorkflow(ctx workflow.Context, in StartBillInput) (bill.Snapshot, error
 	}
 
 	err = workflow.SetUpdateHandlerWithOptions(ctx, UpdateAddLineItem,
-		// Handler: yield-free. Validation has already passed, so this only
-		// mutates and returns.
 		func(ctx workflow.Context, req AddLineItemInput) (bill.AddResult, error) {
 			return b.AddLineItem(bill.LineItem{
 				ID:          req.ItemID,
@@ -223,7 +184,7 @@ func BillWorkflow(ctx workflow.Context, in StartBillInput) (bill.Snapshot, error
 			}, req.CustomerID)
 		},
 		workflow.UpdateHandlerOptions{
-			// Validator: rejects synchronously, so the caller gets a real refusal
+			// The validator rejects synchronously, so the caller gets a real refusal
 			// and the rejection never enters workflow history.
 			Validator: func(ctx workflow.Context, req AddLineItemInput) error {
 				return rejection(b.ValidateLineItem(bill.LineItem{
@@ -239,13 +200,9 @@ func BillWorkflow(ctx workflow.Context, in StartBillInput) (bill.Snapshot, error
 	}
 
 	err = workflow.SetUpdateHandlerWithOptions(ctx, UpdateCloseBill,
-		// Handler: yield-free. It freezes the totals and returns the snapshot the
-		// caller sees, while the invoice hand-off happens in the main loop.
-		//
-		// There is no validator, deliberately. Closing a bill that is already
-		// closing or closed is not a contradiction - the caller wanted the bill
-		// closed and it is - so it returns the frozen invoice with the trigger
-		// that actually caused the close, rather than an error.
+		// No validator, deliberately: closing a bill that is already closing or
+		// closed is not a contradiction, so this returns the frozen invoice with
+		// the trigger that actually caused the close rather than an error.
 		func(ctx workflow.Context, _ CloseBillInput) (bill.Snapshot, error) {
 			return beginClose(bill.TriggerAPIRequest)
 		},
@@ -254,26 +211,20 @@ func BillWorkflow(ctx workflow.Context, in StartBillInput) (bill.Snapshot, error
 		return bill.Snapshot{}, err
 	}
 
-	// The two close triggers, raced in a selector. The timer is a durable
-	// Temporal timer built from workflow.Now - never time.Now, which would be
-	// non-deterministic on replay and would break every in-flight bill the moment
-	// a worker restarted.
-	// Clamped at zero. A period already past yields a negative duration, and while
-	// the API refuses such a period, the workflow must not depend on that: a bill
-	// started by any other route should close at once rather than on a timer whose
-	// duration is meaningless.
+	// workflow.Now, never time.Now: the latter is non-deterministic on replay and
+	// would break every in-flight bill the moment a worker restarted.
 	untilPeriodEnd := b.PeriodEnd().Sub(workflow.Now(ctx))
+	// Clamped: a period already past yields a negative duration, and the workflow
+	// must not depend on the API having refused it.
 	if untilPeriodEnd < 0 {
 		untilPeriodEnd = 0
 	}
 	periodTimer := workflow.NewTimer(ctx, untilPeriodEnd)
 
-	// A failure to close at period end cannot be swallowed here. The timer has
-	// already fired and there is no second one, so the Await below would block
-	// forever: the bill would sit OPEN past the end of its period, still taking
-	// charges, never invoiced and never persisted. It is carried out of the
-	// callback and fails the workflow instead, which is visible and alertable
-	// where an eternal wait is neither.
+	// A failure to close at period end cannot be swallowed in the callback. The
+	// timer has already fired and there is no second one, so the Await below would
+	// block forever and the bill would sit OPEN past its period, still taking
+	// charges, never invoiced. Carried out and failed on instead.
 	var periodEndCloseErr error
 
 	selector := workflow.NewSelector(ctx)
@@ -287,8 +238,7 @@ func BillWorkflow(ctx workflow.Context, in StartBillInput) (bill.Snapshot, error
 		}
 	})
 	selector.AddFuture(closeRequested, func(workflow.Future) {
-		// The close handler already froze the totals; this branch exists only to
-		// end the wait.
+		// The close handler already froze the totals; this only ends the wait.
 	})
 	selector.Select(ctx)
 
@@ -297,8 +247,8 @@ func BillWorkflow(ctx workflow.Context, in StartBillInput) (bill.Snapshot, error
 			periodEndCloseErr.Error(), ClassifyRejection(periodEndCloseErr), periodEndCloseErr)
 	}
 
-	// Belt and braces: the selector woke us, but the bill is only genuinely
-	// closed once its state says so.
+	// The selector woke us, but the bill is only genuinely closed once its state
+	// says so.
 	if err := workflow.Await(ctx, func() bool { return b.State() != bill.StateOpen }); err != nil {
 		return bill.Snapshot{}, err
 	}
@@ -308,10 +258,9 @@ func BillWorkflow(ctx workflow.Context, in StartBillInput) (bill.Snapshot, error
 		"billID", b.ID(), "closedBy", frozen.ClosedBy,
 		"total", frozen.Total.String(), "lineItems", len(frozen.LineItems))
 
-	// Persist before emitting. The ordering is deliberate: if the hand-off keeps
-	// failing, the durable record of what was charged still exists. The reverse
-	// ordering would allow an invoice to reach the payee with no record of it
-	// here, which is the worse of the two failures.
+	// Persist before emitting: if the hand-off keeps failing, the durable record
+	// of what was charged still exists. The reverse ordering would let an invoice
+	// reach the payee with no record of it here, the worse of the two failures.
 	pctx := workflow.WithActivityOptions(ctx, persistOptions())
 	if err := workflow.ExecuteActivity(pctx, ActivityPersistInvoice, frozen).Get(pctx, nil); err != nil {
 		return bill.Snapshot{}, err
@@ -319,7 +268,7 @@ func BillWorkflow(ctx workflow.Context, in StartBillInput) (bill.Snapshot, error
 
 	ectx := workflow.WithActivityOptions(ctx, emitOptions())
 	if err := workflow.ExecuteActivity(ectx, ActivityEmitInvoice, frozen).Get(ectx, nil); err != nil {
-		// The bill stays visibly in CLOSING with its frozen total. That is the
+		// The bill stays visibly in CLOSING with its frozen total, which is the
 		// honest state: the totals are final, the hand-off is not done.
 		return bill.Snapshot{}, err
 	}
@@ -328,8 +277,8 @@ func BillWorkflow(ctx workflow.Context, in StartBillInput) (bill.Snapshot, error
 		return bill.Snapshot{}, err
 	}
 
-	// Record the terminal state durably. Until this lands, storage says CLOSING,
-	// which is true: CLOSED means the hand-off completed.
+	// Until this lands, storage says CLOSING, which is true: CLOSED means the
+	// hand-off completed.
 	final := b.Snapshot()
 	if err := workflow.ExecuteActivity(pctx, ActivityFinalizeInvoice, FinalizeInvoiceInput{
 		BillID: b.ID(),

@@ -275,16 +275,13 @@ func TestSaveInvoiceWithNoLineItems(t *testing.T) {
 // closure", and "A closed bill SHALL remain retrievable indefinitely, and SHALL
 // NOT become unavailable through the passage of time".
 //
-// The passage of time itself cannot be tested here: what expires is Temporal's
-// history retention, twenty-four hours on the dev server and days to weeks in
-// production. What can be tested is the property that makes the requirement hold
-// - that the invoice is readable with no workflow in the picture at all.
+// The passage of time cannot be tested directly - what expires is Temporal's
+// history retention. What can be tested is the property that makes the
+// requirement hold: the invoice is readable with no workflow in the picture.
 //
-// This test never starts one. It writes an invoice the way the closing activity
-// does and reads it back through the same function the API uses once a workflow
-// is gone, which is precisely the path a bill takes after its history has aged
-// out. A Temporal query is a view of live process state, not storage, and this is
-// the test that says so.
+// So this never starts one. It writes an invoice the way the closing activity
+// does and reads it back through the function the API uses once a workflow is
+// gone, which is the path a bill takes after its history has aged out.
 func TestClosedInvoiceIsReadableWithNoWorkflowInvolved(t *testing.T) {
 	ctx := context.Background()
 

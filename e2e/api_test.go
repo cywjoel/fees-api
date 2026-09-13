@@ -80,14 +80,11 @@ func do(t *testing.T, method, path string, body any, headers map[string]string) 
 }
 
 // request performs a call and returns a transport failure rather than ending the
-// test.
+// test. A goroutine must use this, never do().
 //
-// A goroutine must use this, never do(). t.Fatalf stops a test by killing the
-// goroutine it runs on, which is right from the test goroutine and wrong from a
-// spawned one: there it ends that goroutine quietly, the waitgroup still
-// completes, and the test carries on to report a missing result as though the
-// assertion had failed. A refused connection then reads as a lost write, and
-// whoever investigates goes looking for a concurrency defect that is not there.
+// t.Fatalf stops a test by killing the goroutine it runs on - right from the test
+// goroutine, wrong from a spawned one, where it ends that goroutine quietly, the
+// waitgroup still completes, and a refused connection reads as a lost write.
 func request(method, path string, body any, headers map[string]string) (response, error) {
 	var reader io.Reader
 	if body != nil {
@@ -121,12 +118,9 @@ func request(method, path string, body any, headers map[string]string) (response
 
 // createBill opens a bill whose period runs for the given duration.
 //
-// Each call reads the clock afresh, so two calls describe two different fee
-// periods. That is fine for creating unrelated bills, but it must not be used to
-// model a retry: a repeat carrying the same idempotency key and a period a few
-// milliseconds different is a different request, and is refused as key reuse.
-// Use createBillBody for a retry, which resends identical bytes the way a client
-// retrying a failed call actually would.
+// Each call reads the clock afresh, so two calls describe two different periods.
+// Never use it to model a retry - same key, period a few milliseconds different,
+// refused as key reuse. Use createBillBody, which resends identical bytes.
 func createBill(t *testing.T, currency string, period time.Duration, headers map[string]string) response {
 	t.Helper()
 	return do(t, http.MethodPost, "/bills", createBillBody(currency, period), headers)
@@ -604,9 +598,6 @@ func TestAddLineItemStatusMatrix(t *testing.T) {
 // update. The domain cannot demonstrate that, because Bill is deliberately not
 // safe for concurrent use: serialising writes is the workflow's job, so the proof
 // has to come through the real API against a real worker.
-//
-// Distinct amounts make a lost update visible rather than merely possible: a
-// dropped write changes the total by a unique value, so the failure names itself.
 func TestConcurrentLineItemsAreAllRetained(t *testing.T) {
 	requireAPI(t)
 
@@ -621,7 +612,9 @@ func TestConcurrentLineItemsAreAllRetained(t *testing.T) {
 		wantSum  int64
 	)
 	for i := 0; i < items; i++ {
-		amount := int64(100 + i) // distinct, so a lost write is identifiable
+		// Distinct, so a dropped write changes the total by a unique value and the
+		// failure names itself rather than merely being possible.
+		amount := int64(100 + i)
 		wantSum += amount
 		wg.Add(1)
 		go func(i int, amount int64) {
