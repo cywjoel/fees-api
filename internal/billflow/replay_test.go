@@ -15,16 +15,13 @@ import (
 // TestReplayCommittedHistories replays real workflow histories against the
 // current workflow code.
 //
-// This is the guard that matters most for a workflow with a month-long lifetime.
-// Bills stay open across deploys, so new code will routinely be asked to resume
-// executions that older code started. Temporal reconstructs a running workflow by
-// replaying its history through the current code, and if that code now issues a
-// different sequence of commands - an activity moved, a timer added, a branch
-// reordered - replay diverges and the execution is stuck with a
-// non-determinism error.
+// The guard that matters most for a workflow with a month-long lifetime. Bills
+// stay open across deploys, so new code is routinely asked to resume executions
+// older code started; if it now issues a different command sequence - an activity
+// moved, a timer added, a branch reordered - replay diverges and the execution is
+// stuck. Without this the failure appears at deploy time, on live bills.
 //
-// The failure would otherwise appear at deploy time, on live bills, rather than
-// in CI. These fixtures were exported from real executions with:
+// Fixtures were exported with:
 //
 //	temporal workflow show --workflow-id <id> --output json
 //

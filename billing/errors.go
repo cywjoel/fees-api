@@ -14,13 +14,10 @@ import (
 	"fees-api/internal/billflow"
 )
 
-// problem is the error body every endpoint returns, modelled on RFC 9457.
-//
-// The reason field is the machine-readable part, and it is what makes the
-// difference between 409 and 422 actionable rather than decorative: a client
-// seeing bill_not_open knows the charge arrived too late and must not be retried
-// as-is, while currency_mismatch says the request itself was malformed. Both are
-// refusals, but they call for different responses from the caller.
+// problem is the error body every endpoint returns, modelled on RFC 9457. The
+// reason field is what makes the difference between 409 and 422 actionable: a
+// client seeing bill_not_open knows the charge arrived too late and must not be
+// retried as-is, while currency_mismatch says the request itself was malformed.
 type problem struct {
 	Status int    `json:"status"`
 	Reason string `json:"reason"`
@@ -28,9 +25,7 @@ type problem struct {
 	Detail string `json:"detail,omitempty"`
 }
 
-// reasonStatus maps each rejection reason to its status code.
-//
-// The split is deliberate and consistent across the whole API:
+// reasonStatus maps each rejection reason to its status code:
 //
 //	409 - the request contradicts the bill's state or an immutable fact about it
 //	422 - the request is well-formed JSON but cannot be acted on as stated
@@ -64,30 +59,25 @@ var reasonTitle = map[string]string{
 	reasonKeyReuse:                     "Idempotency key already used for a different bill",
 }
 
-// reasonNotFound is used when no bill exists, in the workflow or in storage.
 const reasonNotFound = "bill_not_found"
 
-// reasonKeyReuse reports that an idempotency key was reused for a request that
-// differs from the one it first satisfied. It is a contradiction, not a retry,
-// so it is a 409 - consistent with reusing a line item id for a different charge.
+// reasonKeyReuse is a contradiction, not a retry, so it is a 409 - consistent
+// with reusing a line item id for a different charge.
 const reasonKeyReuse = "idempotency_key_reuse"
 
-// reasonUnavailable reports that the system could not determine a bill's state,
-// because the workflow holding it could not be reached in time.
+// reasonUnavailable means a bill's state could not be determined, because the
+// workflow holding it could not be reached in time.
 //
-// It is deliberately distinct from reasonNotFound. "I cannot reach it" and "it
-// does not exist" call for opposite responses from a caller: the first should be
-// retried, the second must not be. Reporting the first as the second invites a
-// client to conclude its bill was never created, or that a charge it made was
-// never recorded, and to act on that.
+// Deliberately distinct from reasonNotFound. "I cannot reach it" and "it does not
+// exist" call for opposite responses: the first should be retried, the second
+// must not be. Reporting the first as the second invites a client to conclude its
+// bill was never created, and to act on that.
 const reasonUnavailable = "temporarily_unavailable"
 
-// retryAfter is advertised on a 503. The failures it covers are transport
-// hiccups and momentarily busy workflows, which clear in seconds rather than
-// minutes; a short interval is more useful to a caller than a conservative one.
+// retryAfter is advertised on a 503. The failures it covers clear in seconds
+// rather than minutes, so a short interval is more useful than a conservative one.
 const retryAfter = 2 * time.Second
 
-// writeJSON writes a success response.
 func writeJSON(w http.ResponseWriter, status int, body any) {
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	w.WriteHeader(status)
@@ -96,7 +86,6 @@ func writeJSON(w http.ResponseWriter, status int, body any) {
 	}
 }
 
-// writeProblem writes an error response with an explicit reason.
 func writeProblem(w http.ResponseWriter, status int, reason, detail string) {
 	title, ok := reasonTitle[reason]
 	if !ok {
@@ -112,7 +101,6 @@ func writeProblem(w http.ResponseWriter, status int, reason, detail string) {
 	})
 }
 
-// writeNotFound reports a bill that exists in neither the workflow nor storage.
 func writeNotFound(w http.ResponseWriter, billID string) {
 	w.Header().Set("Content-Type", "application/problem+json; charset=utf-8")
 	w.WriteHeader(http.StatusNotFound)
@@ -125,9 +113,10 @@ func writeNotFound(w http.ResponseWriter, billID string) {
 }
 
 // writeUnavailable reports that the bill could not be reached, and says when to
-// try again. The Retry-After header is the actionable half: without it a caller
-// has no way to tell a transient 503 from a permanent one.
+// try again.
 func writeUnavailable(w http.ResponseWriter, detail string) {
+	// The actionable half: without it a caller cannot tell a transient 503 from a
+	// permanent one.
 	w.Header().Set("Retry-After", strconv.Itoa(int(retryAfter.Seconds())))
 	writeProblem(w, http.StatusServiceUnavailable, reasonUnavailable, detail)
 }
@@ -136,9 +125,8 @@ func writeUnavailable(w http.ResponseWriter, detail string) {
 // response.
 //
 // A rejected update arrives as an application error carrying the reason the
-// workflow's validator assigned it. Anything else - a transport failure, a
-// workflow that no longer exists - is not a business refusal and is reported as
-// such rather than being flattened into a 400.
+// validator assigned it; anything else is not a business refusal and is reported
+// as such rather than flattened into a 400.
 func writeRejection(w http.ResponseWriter, err error) {
 	var appErr *temporal.ApplicationError
 	if errors.As(err, &appErr) {
@@ -153,24 +141,21 @@ func writeRejection(w http.ResponseWriter, err error) {
 	writeProblem(w, http.StatusInternalServerError, billflow.ReasonInternal, err.Error())
 }
 
-// The three questions that replace a single "is the workflow gone?".
+// The three predicates below replace a single "is the workflow gone?", which
+// answered true for three unrelated conditions and turned every one into a 404.
+// Only one means the bill is absent; the other two describe a workflow that is
+// very much present, and the caller must act differently on each:
 //
-// That one predicate answered true for three unrelated conditions, and every
-// true became a 404. Only one of them means the bill is absent; the other two
-// describe a workflow that is very much present. They are separated here because
-// the caller must act differently on each:
-//
-//	absent         -> durable storage is the only source; 404 only if it has nothing
+//	absent         -> storage is the only source; 404 only if it has nothing
 //	busy           -> 503 with Retry-After; the bill exists and will answer later
-//	already started -> the execution exists right now; creation's "already exists" path
+//	already started -> the execution exists right now; creation's "already exists"
 //
 // Keeping them apart is what stops a momentary hiccup being reported as a
 // deleted bill.
 
-// isWorkflowAbsent reports whether the workflow is not there to be asked or acted
-// on - it never existed, its history has aged out, or it has completed and so can
-// no longer accept an update. In every case durable storage is the only remaining
-// source of truth for the bill, which may still hold its invoice.
+// isWorkflowAbsent reports that the workflow is not there to be asked - it never
+// existed, its history has aged out, or it has completed. In every case storage
+// is the only remaining source of truth.
 func isWorkflowAbsent(err error) bool {
 	if err == nil {
 		return false
@@ -179,13 +164,11 @@ func isWorkflowAbsent(err error) bool {
 	return errors.As(err, &notFound)
 }
 
-// isWorkflowBusy reports whether the failure is transient - the workflow service
-// was unreachable, overloaded, or the execution was momentarily unable to answer.
+// isWorkflowBusy reports a transient failure.
 //
-// None of these say anything about whether the bill exists, which is precisely
-// why they must not reach storage: an open bill has no persisted row until it
-// closes, so falling back would answer "no such bill" for a bill that is running
-// and accruing charges.
+// None of these say anything about whether the bill exists, which is why they
+// must not fall through to storage: an open bill has no persisted row until it
+// closes, so falling back would answer "no such bill" for one that is running.
 func isWorkflowBusy(err error) bool {
 	if err == nil {
 		return false
@@ -208,12 +191,11 @@ func isWorkflowBusy(err error) bool {
 	}
 }
 
-// isWorkflowAlreadyStarted reports whether a start request collided with an
-// execution that already exists.
+// isWorkflowAlreadyStarted reports that a start request collided with an
+// execution that already exists - the opposite of absence.
 //
-// This is the opposite of absence, and it is useful in exactly one place: bill
-// creation, where it means the idempotency key has already produced a bill. It
-// must never be read as the bill being missing.
+// Useful in exactly one place: bill creation, where it means the idempotency key
+// has already produced a bill. It must never be read as the bill being missing.
 func isWorkflowAlreadyStarted(err error) bool {
 	if err == nil {
 		return false

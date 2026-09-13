@@ -26,38 +26,27 @@ var ErrInvoiceNotFound = errors.New("billing: invoice not found")
 // storageTimePrecision is the resolution a TIMESTAMPTZ column keeps.
 //
 // Go's time.Time carries nanoseconds and PostgreSQL's does not, so an instant
-// that travels through storage comes back truncated. Comparing a truncated
-// instant against the untruncated original finds them different, which is how a
-// correct retry came to be refused as idempotency-key reuse once a bill's
-// workflow had aged out and storage became the only source for its fee period.
+// that travels through storage comes back truncated - which is how a correct
+// retry came to be refused as key reuse once a bill's workflow had aged out.
 const storageTimePrecision = time.Microsecond
 
 // atStoragePrecision truncates an instant to the resolution it will survive at.
-//
-// Applied to a fee period on the way in, so that what a bill reports is what can
-// actually be recorded, and applied again wherever two instants are compared, so
-// that a bill created before that was true still matches a correct retry.
+// Applied to a fee period on the way in, and again wherever two instants are
+// compared.
 func atStoragePrecision(t time.Time) time.Time {
 	return t.Truncate(storageTimePrecision)
 }
 
-// saveInvoice writes a frozen invoice and its line items.
-//
-// The write is idempotent because the activity that calls it may be retried:
-// Temporal guarantees an activity runs at least once, not exactly once. Re-running
-// it must leave one invoice row and one row per line item, never duplicates.
-//
-// Line items are immutable once accrued, so a conflicting item id is left alone
-// rather than overwritten. The invoice row itself is upserted, because a retry
-// may be carrying a later state for the same frozen totals.
+// saveInvoice writes a frozen invoice and its line items, idempotently: the
+// calling activity may be retried, and re-running must leave one invoice row and
+// one row per line item.
 func saveInvoice(ctx context.Context, snap bill.Snapshot) error {
 	if snap.ClosedAt == nil {
 		return fmt.Errorf("billing: refusing to persist bill %q with no closure time", snap.ID)
 	}
 	if strings.TrimSpace(snap.CustomerID) == "" {
 		// Checked here as well as by the column constraint, so the failure names
-		// itself instead of arriving as a constraint violation from the driver.
-		// Reachable only for a bill started before bills had customers.
+		// itself instead of arriving as a driver-level constraint violation.
 		return fmt.Errorf("billing: refusing to persist bill %q with a blank customer; "+
 			"an invoice has to be billable to someone", snap.ID)
 	}
@@ -73,6 +62,7 @@ func saveInvoice(ctx context.Context, snap bill.Snapshot) error {
 			bill_id, customer_id, state, currency, period_start, period_end, created_at,
 			total_minor_units, closed_at, closed_by
 		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+		-- Upserted: a retry may carry a later state for the same frozen totals.
 		ON CONFLICT (bill_id) DO UPDATE SET
 			state             = EXCLUDED.state,
 			total_minor_units = EXCLUDED.total_minor_units,
@@ -91,6 +81,7 @@ func saveInvoice(ctx context.Context, snap bill.Snapshot) error {
 			INSERT INTO invoice_line_item (
 				bill_id, item_id, amount_minor_units, currency, description, accrued_at, seq
 			) VALUES ($1, $2, $3, $4, $5, $6, $7)
+			-- Left alone, never overwritten: a line item is immutable once accrued.
 			ON CONFLICT (bill_id, item_id) DO NOTHING
 		`,
 			snap.ID, item.ID, item.Amount.MinorUnits(), item.Amount.Currency().Code,
@@ -106,13 +97,9 @@ func saveInvoice(ctx context.Context, snap bill.Snapshot) error {
 	return nil
 }
 
-// setInvoiceState records a bill's terminal state.
-//
-// It is separate from saveInvoice because the two happen either side of the
-// invoice hand-off: the invoice is recorded before the hand-off is attempted, so
-// a hand-off that keeps failing still leaves a durable record of what was
-// charged, and the state is advanced to CLOSED only once the hand-off succeeds.
-// Until then storage says CLOSING, which is the truth.
+// setInvoiceState records a bill's terminal state. Separate from saveInvoice
+// because the two straddle the invoice hand-off: until it succeeds, storage says
+// CLOSING, which is the truth.
 func setInvoiceState(ctx context.Context, billID string, state bill.State) error {
 	if _, err := billsDB.Exec(ctx, `
 		UPDATE invoice SET state = $2 WHERE bill_id = $1

@@ -18,23 +18,17 @@ import (
 // defaultTemporalHostPort is the address of a local `temporal server start-dev`.
 const defaultTemporalHostPort = "127.0.0.1:7233"
 
-// dataConverter encodes everything crossing the boundary to Temporal.
-//
-// It is named once and shared, because bill creation starts its workflow through
-// the raw service API and must encode that input itself. Were the client
-// configured with one converter and the start request encoded with another, the
-// workflow would receive input it could not read.
+// dataConverter is named once and shared because bill creation starts its
+// workflow through the raw service API and must encode that input itself. Two
+// different converters would hand the workflow input it could not read.
 var dataConverter = converter.GetDefaultDataConverter()
 
 // Service holds the Temporal client the API endpoints use and the worker that
 // executes bill workflows.
 //
-// This is the one seam where Encore and Temporal do not compose automatically.
-// Encore provisions its own infrastructure - databases, queues, cron - from
-// declarations in code, but Temporal is not one of its resources, so the worker
-// is an ordinary long-lived goroutine that something has to own. An Encore
-// service struct is that owner: initService starts the worker when the service
-// starts, and Shutdown stops it when the service stops.
+// This is the one seam where Encore and Temporal do not compose automatically:
+// Temporal is not an Encore resource, so the worker is an ordinary long-lived
+// goroutine that something has to own. The service struct is that owner.
 //
 //encore:service
 type Service struct {
@@ -42,9 +36,8 @@ type Service struct {
 	worker   worker.Worker
 }
 
-// temporalHostPort returns the Temporal frontend address, overridable so the
-// service can point at a dev server, a docker-compose cluster, or Temporal Cloud
-// without a code change.
+// temporalHostPort is overridable so the service can point at a dev server, a
+// compose cluster, or Temporal Cloud without a code change.
 func temporalHostPort() string {
 	if hp := os.Getenv("TEMPORAL_HOSTPORT"); hp != "" {
 		return hp
@@ -52,7 +45,6 @@ func temporalHostPort() string {
 	return defaultTemporalHostPort
 }
 
-// temporalNamespace returns the namespace to run bills in.
 func temporalNamespace() string {
 	if ns := os.Getenv("TEMPORAL_NAMESPACE"); ns != "" {
 		return ns
@@ -62,9 +54,8 @@ func temporalNamespace() string {
 
 // initService dials Temporal and starts the bill worker.
 //
-// Encore calls this once when the service starts. A failure here fails startup,
-// which is the behaviour we want: a Fees API whose worker is not running would
-// accept bills that never accrue, close, or invoice, and would do so silently.
+// A failure here fails startup deliberately: a Fees API whose worker is not
+// running would accept bills that never accrue, close, or invoice, in silence.
 func initService() (*Service, error) {
 	hostPort := temporalHostPort()
 	namespace := temporalNamespace()
@@ -82,15 +73,15 @@ func initService() (*Service, error) {
 	}
 
 	w := worker.New(c, billflow.TaskQueue, worker.Options{})
-	// Registered under an explicit name, the same constant the start request
-	// names, so a rename of the Go function cannot silently orphan running bills.
+	// Explicit name, the same constant the start request names, so renaming the Go
+	// function cannot silently orphan running bills.
 	w.RegisterWorkflowWithOptions(billflow.BillWorkflow,
 		workflow.RegisterOptions{Name: billflow.WorkflowTypeName})
 
+	// Likewise explicit: the workflow refers to activities by constant rather than
+	// by function reference, which keeps its package free of any dependency on this
+	// one.
 	acts := &Activities{}
-	// Activities are registered under explicit names. The workflow refers to them
-	// by those same constants rather than by Go function reference, which keeps
-	// the workflow package free of any dependency on this one.
 	w.RegisterActivityWithOptions(acts.PersistInvoice,
 		activity.RegisterOptions{Name: billflow.ActivityPersistInvoice})
 	w.RegisterActivityWithOptions(acts.EmitInvoice,
@@ -110,15 +101,12 @@ func initService() (*Service, error) {
 }
 
 // Shutdown stops the worker and closes the Temporal connection.
-//
-// Encore calls this on graceful shutdown. worker.Stop blocks until in-flight
-// workflow and activity tasks have been returned to the server, so a deploy does
-// not abandon work mid-task; anything not finished is simply retried by whichever
-// worker picks it up next. That is the ordinary case, not an error path: a bill's
-// workflow outlives any individual worker process by design.
 func (s *Service) Shutdown(force context.Context) {
 	rlog.Info("stopping bill worker")
 	if s.worker != nil {
+		// Blocks until in-flight tasks are returned to the server, so a deploy does
+		// not abandon work mid-task; anything unfinished is retried by whichever
+		// worker picks it up next. A bill's workflow outlives any worker process.
 		s.worker.Stop()
 	}
 	if s.temporal != nil {
@@ -127,8 +115,7 @@ func (s *Service) Shutdown(force context.Context) {
 	rlog.Info("bill worker stopped")
 }
 
-// temporalLogger routes the Temporal SDK's logs through Encore's structured
-// logger, so worker output appears in the same stream as everything else.
+// temporalLogger routes the SDK's logs through Encore's structured logger.
 type temporalLogger struct{}
 
 func (temporalLogger) Debug(msg string, kv ...any) { rlog.Debug(msg, toStrings(kv)...) }
@@ -136,8 +123,8 @@ func (temporalLogger) Info(msg string, kv ...any)  { rlog.Info(msg, toStrings(kv
 func (temporalLogger) Warn(msg string, kv ...any)  { rlog.Warn(msg, toStrings(kv)...) }
 func (temporalLogger) Error(msg string, kv ...any) { rlog.Error(msg, toStrings(kv)...) }
 
-// toStrings normalises the SDK's alternating key/value pairs for rlog, whose
-// keys must be strings.
+// toStrings normalises the SDK's alternating key/value pairs for rlog, whose keys
+// must be strings.
 func toStrings(kv []any) []any {
 	out := make([]any, 0, len(kv))
 	for i, v := range kv {
