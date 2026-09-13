@@ -3,6 +3,7 @@ package billing
 import (
 	"context"
 	"errors"
+	"fmt"
 	"testing"
 	"time"
 
@@ -27,6 +28,7 @@ func testSnapshot(billID string, state bill.State, items ...bill.LineItem) bill.
 		items = []bill.LineItem{}
 	}
 	return bill.Snapshot{
+		CustomerID:  "acme",
 		ID:          billID,
 		State:       state,
 		Currency:    testUSD,
@@ -390,5 +392,101 @@ func TestFeePeriodComparisonSurvivesStorageTruncation(t *testing.T) {
 	}
 	if matchesRequest(stored, money.MustLookup("GEL"), in) {
 		t.Error("a request in a different currency matched")
+	}
+}
+
+// Spec: billing/bill-lifecycle - "The customer survives the workflow".
+//
+// A closed bill is read from storage once its workflow has gone, so the customer
+// has to make the trip through Postgres. This is the same path the fee period's
+// precision defect lived on, and the one CI never exercises end to end.
+func TestCustomerSurvivesStorage(t *testing.T) {
+	ctx := context.Background()
+	snap := testSnapshot("bill_customer_roundtrip", bill.StateClosed, testItem("txn_1", 500, "card fee"))
+	snap.CustomerID = "acme-holdings-gmbh"
+
+	if err := saveInvoice(ctx, snap); err != nil {
+		t.Fatalf("saveInvoice returned error: %v", err)
+	}
+	got, err := loadInvoice(ctx, snap.ID)
+	if err != nil {
+		t.Fatalf("loadInvoice returned error: %v", err)
+	}
+	if got.CustomerID != "acme-holdings-gmbh" {
+		t.Errorf("customer = %q, want the one it was closed with", got.CustomerID)
+	}
+}
+
+// The identifier is opaque: stored and returned unchanged, whatever its shape.
+func TestCustomerIdentifierIsOpaque(t *testing.T) {
+	ctx := context.Background()
+	for i, id := range []string{
+		"cus_01JB2K9XQZ", "acme", "urn:acct:1234", "  spaced  ", "混合-文字",
+	} {
+		snap := testSnapshot(fmt.Sprintf("bill_opaque_%d", i), bill.StateClosed)
+		snap.CustomerID = id
+		if err := saveInvoice(ctx, snap); err != nil {
+			t.Fatalf("saveInvoice(%q) returned error: %v", id, err)
+		}
+		got, err := loadInvoice(ctx, snap.ID)
+		if err != nil {
+			t.Fatalf("loadInvoice(%q) returned error: %v", id, err)
+		}
+		if got.CustomerID != id {
+			t.Errorf("customer round-tripped as %q, want %q unchanged", got.CustomerID, id)
+		}
+	}
+}
+
+// Finding 2: NOT NULL was chosen over a nullable column so that "an invoice with
+// no payee" would stop being representable, and an empty string is not NULL. A
+// bill started before bills had customers replays with an empty one, and closing
+// it wrote a permanently ownerless invoice.
+//
+// It must now fail loudly instead. That is the deliberate cost of the fix: such a
+// bill cannot be persisted at all, which is better than recording an invoice
+// nobody can be billed for.
+func TestOwnerlessInvoiceIsRefused(t *testing.T) {
+	ctx := context.Background()
+	snap := testSnapshot("bill_no_owner", bill.StateClosed, testItem("txn_1", 100, "fee"))
+	snap.CustomerID = ""
+
+	if err := saveInvoice(ctx, snap); err == nil {
+		got, _ := loadInvoice(ctx, snap.ID)
+		t.Fatalf("an invoice with no customer was persisted and read back as %q\n\n"+
+			"NOT NULL does not prevent this: '' is not NULL.", got.CustomerID)
+	}
+}
+
+// "Not empty" is not "has an owner": ' ' <> ” is true, so a whitespace-only
+// identifier satisfied the previous constraint and a bill owned by nothing
+// closed and persisted normally.
+//
+// The identifier stays opaque. What is rejected is a value with no content;
+// what is stored is whatever was sent, whitespace included.
+func TestBlankCustomerIsRefusedButPaddingIsPreserved(t *testing.T) {
+	ctx := context.Background()
+
+	for _, blank := range []string{"", " ", "   ", "\t", "\n", " \t \n "} {
+		snap := testSnapshot("bill_blank_"+fmt.Sprint(len(blank))+blank, bill.StateClosed)
+		snap.CustomerID = blank
+		if err := saveInvoice(ctx, snap); err == nil {
+			t.Errorf("a bill owned by %q was persisted; it is billable to nobody", blank)
+		}
+	}
+
+	padded := testSnapshot("bill_padded", bill.StateClosed, testItem("txn_1", 100, "fee"))
+	padded.CustomerID = "  acme  "
+	if err := saveInvoice(ctx, padded); err != nil {
+		t.Fatalf("an identifier with meaningful padding was refused: %v", err)
+	}
+	got, err := loadInvoice(ctx, padded.ID)
+	if err != nil {
+		t.Fatalf("loadInvoice returned error: %v", err)
+	}
+	if got.CustomerID != "  acme  " {
+		t.Errorf("customer stored as %q, want %q unchanged - trimming what is stored "+
+			"would change bill ids for anyone whose identifiers carry whitespace",
+			got.CustomerID, "  acme  ")
 	}
 }

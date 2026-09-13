@@ -168,9 +168,15 @@ jobs:
           fi
           echo "ran $passed end-to-end cases, none skipped"
         env:
-          # Raise this when cases are added. It is the guard against a suite that
-          # quietly shrinks to nothing while still reporting success.
-          MIN_E2E_CASES: 17
+          # Raise this when cases are added; it must never be lowered. It guards
+          # against a suite that quietly shrinks while still reporting success.
+          #
+          # Derive it by counting test functions, not by counting PASS lines from
+          # a run: a run with failures reports fewer passes, and taking the number
+          # from one silently relaxes the guard. That happened once already.
+          #
+          #   grep -c '^func Test' e2e/*_test.go   # minus TestMain
+          MIN_E2E_CASES: 22
 
       - name: Show the logs on failure
         if: failure()

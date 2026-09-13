@@ -20,6 +20,15 @@ var (
 	// rather than resolved by overwriting.
 	ErrLineItemConflict = errors.New("bill: line item id already used with different detail")
 
+	// ErrCustomerMismatch is returned when a line item states a customer that is
+	// not the one the bill belongs to.
+	//
+	// The caller already chose the bill by its identifier, so this does not tell
+	// the system who is being charged - it tells the system whether the caller and
+	// the bill agree. A fee engine that computes the wrong bill id otherwise
+	// charges the wrong customer in silence.
+	ErrCustomerMismatch = errors.New("bill: line item customer does not match the bill")
+
 	// ErrInvalidLineItem is returned when a line item is missing required detail.
 	ErrInvalidLineItem = errors.New("bill: line item is missing required detail")
 
@@ -77,6 +86,7 @@ type AddResult struct {
 // bill it is the invoice: the total charged and every line item comprising it.
 type Snapshot struct {
 	ID          string         `json:"id"`
+	CustomerID  string         `json:"customerId"`
 	State       State          `json:"state"`
 	Currency    money.Currency `json:"currency"`
 	PeriodStart time.Time      `json:"periodStart"`
@@ -97,6 +107,7 @@ type Snapshot struct {
 // have.
 type Bill struct {
 	id          string
+	customerID  string
 	currency    money.Currency
 	periodStart time.Time
 	periodEnd   time.Time
@@ -115,8 +126,24 @@ type Bill struct {
 	closedBy Trigger
 }
 
-// New opens a bill for a fee period.
-func New(id string, currency money.Currency, periodStart, periodEnd, createdAt time.Time) (*Bill, error) {
+// New opens a bill for a fee period, belonging to a customer.
+//
+// It deliberately does NOT reject an empty customer, and that omission is
+// load-bearing rather than an oversight.
+//
+// A bill's workflow may run for a month, and Temporal reconstructs a running one
+// by replaying its recorded history through whatever code is deployed now. A
+// history recorded before the customer existed decodes with an empty one -
+// legally and silently. Were this constructor to reject that, the workflow would
+// return before issuing any command, while the history it is being replayed
+// against records a timer and two activities. Replay would diverge, and every
+// bill open across the deploy would be stranded.
+//
+// The requirement that a customer be supplied therefore lives at the API
+// boundary, where it runs once per request and never on replay. A later
+// "tightening" here would break bills that are already running; the test for
+// this defends the omission.
+func New(id string, customerID string, currency money.Currency, periodStart, periodEnd, createdAt time.Time) (*Bill, error) {
 	if id == "" {
 		return nil, fmt.Errorf("%w: id is required", ErrInvalidBill)
 	}
@@ -129,6 +156,7 @@ func New(id string, currency money.Currency, periodStart, periodEnd, createdAt t
 	}
 	return &Bill{
 		id:          id,
+		customerID:  customerID,
 		currency:    currency,
 		periodStart: periodStart,
 		periodEnd:   periodEnd,
@@ -141,6 +169,10 @@ func New(id string, currency money.Currency, periodStart, periodEnd, createdAt t
 
 // ID returns the bill's identifier.
 func (b *Bill) ID() string { return b.id }
+
+// CustomerID returns the customer the bill belongs to. It is empty only for a
+// bill created before bills had owners; see New.
+func (b *Bill) CustomerID() string { return b.customerID }
 
 // State returns the bill's current lifecycle state.
 func (b *Bill) State() State { return b.state }
@@ -162,8 +194,8 @@ func (b *Bill) Total() money.Money { return b.total }
 // enters workflow history. A rejected update is never recorded; an update that
 // fails inside its handler is. Validating first is therefore both the correct
 // semantics - the caller gets a synchronous refusal - and the cheaper one.
-func (b *Bill) ValidateLineItem(item LineItem) error {
-	_, err := b.checkLineItem(item)
+func (b *Bill) ValidateLineItem(item LineItem, assertCustomerID string) error {
+	_, err := b.checkLineItem(item, assertCustomerID)
 	return err
 }
 
@@ -185,9 +217,50 @@ func validateLineItem(item LineItem) error {
 
 // checkLineItem applies every acceptance rule without mutating the bill. It
 // returns the already-accrued item when the addition is an idempotent retry.
-func (b *Bill) checkLineItem(item LineItem) (*LineItem, error) {
+// assertCustomerID is what the caller believes this bill's customer to be, or
+// empty when it did not say. It is compared, never stored: the caller already
+// chose the bill by its identifier, so this establishes whether the caller and
+// the bill agree, not who is being charged.
+//
+// It is checked first, before deduplication and before the state check, and that
+// position is deliberate rather than incidental.
+//
+// The customer assertion is not the same kind of check as the currency, though
+// the two look alike. The currency asks whether this charge is compatible with
+// this bill, which only matters once the bill can accept charges at all - so it
+// belongs after the state check. The customer asks whether this is the right bill
+// in the first place. If it is not, nothing that follows is meaningful: whether
+// the bill is open, and whether it already carries an item with this id, are
+// facts about a bill the caller did not mean to address.
+//
+// Checking it after deduplication made the checksum silent exactly where it was
+// most needed. A fee engine that computes the wrong bill id and re-sends was told
+// "already accrued" for a charge sitting on someone else's invoice, because an
+// item with that id happened to exist there.
+//
+// An empty assertion is not a mismatch. A workflow history recorded before the
+// field existed decodes it as empty, so treating absence as disagreement would
+// introduce a branch on that absence and break replay.
+func (b *Bill) checkLineItem(item LineItem, assertCustomerID string) (*LineItem, error) {
 	if err := validateLineItem(item); err != nil {
 		return nil, err
+	}
+
+	if assertCustomerID != "" && assertCustomerID != b.customerID {
+		// The bill's own customer is deliberately not named.
+		//
+		// A check that reveals the right answer when the caller guesses wrong is a
+		// lookup with extra steps. Today that leaks nothing, because retrieving the
+		// bill reports its customer anyway - but the design expects authentication
+		// upstream, and the moment retrieval starts refusing strangers this message
+		// would keep answering the question retrieval has stopped answering. Whoever
+		// builds that layer will check the read endpoints; nobody thinks of an error
+		// message as somewhere data escapes from.
+		//
+		// The caller learns what it needs: it addressed the wrong bill, and should
+		// fix the id it computed.
+		return nil, fmt.Errorf("%w: line item states a customer that is not the one bill %q belongs to",
+			ErrCustomerMismatch, b.id)
 	}
 
 	// Deduplication precedes the state check. An identical retry of an item that
@@ -224,9 +297,17 @@ func (b *Bill) checkLineItem(item LineItem) (*LineItem, error) {
 // It returns the already-accrued item when the addition is an identical retry,
 // ErrLineItemConflict when the identifier was reused with different detail, and
 // ErrNotOpen when the charge is genuinely new and has arrived too late.
-func CheckAgainstSnapshot(snap Snapshot, item LineItem) (*LineItem, error) {
+func CheckAgainstSnapshot(snap Snapshot, item LineItem, assertCustomerID string) (*LineItem, error) {
 	if err := validateLineItem(item); err != nil {
 		return nil, err
+	}
+
+	// First, as on the live path: addressing the wrong bill makes everything
+	// after it a fact about a bill the caller did not mean to reach.
+	if assertCustomerID != "" && assertCustomerID != snap.CustomerID {
+		// Named neither here nor on the live path; see checkLineItem.
+		return nil, fmt.Errorf("%w: line item states a customer that is not the one bill %q belongs to",
+			ErrCustomerMismatch, snap.ID)
 	}
 	for _, existing := range snap.LineItems {
 		if existing.ID != item.ID {
@@ -252,8 +333,8 @@ func CheckAgainstSnapshot(snap Snapshot, item LineItem) (*LineItem, error) {
 // returns the one already accrued and leaves the total untouched, so a client
 // that retries after a timeout cannot double-charge. Re-offering the identifier
 // with different detail is a conflict, not a retry.
-func (b *Bill) AddLineItem(item LineItem) (AddResult, error) {
-	existing, err := b.checkLineItem(item)
+func (b *Bill) AddLineItem(item LineItem, assertCustomerID string) (AddResult, error) {
+	existing, err := b.checkLineItem(item, assertCustomerID)
 	if err != nil {
 		return AddResult{}, err
 	}
@@ -332,6 +413,7 @@ func (b *Bill) LineItems() []LineItem {
 func (b *Bill) Snapshot() Snapshot {
 	s := Snapshot{
 		ID:          b.id,
+		CustomerID:  b.customerID,
 		State:       b.state,
 		Currency:    b.currency,
 		PeriodStart: b.periodStart,

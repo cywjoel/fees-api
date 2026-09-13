@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"encore.dev/storage/sqldb"
@@ -53,6 +54,13 @@ func saveInvoice(ctx context.Context, snap bill.Snapshot) error {
 	if snap.ClosedAt == nil {
 		return fmt.Errorf("billing: refusing to persist bill %q with no closure time", snap.ID)
 	}
+	if strings.TrimSpace(snap.CustomerID) == "" {
+		// Checked here as well as by the column constraint, so the failure names
+		// itself instead of arriving as a constraint violation from the driver.
+		// Reachable only for a bill started before bills had customers.
+		return fmt.Errorf("billing: refusing to persist bill %q with a blank customer; "+
+			"an invoice has to be billable to someone", snap.ID)
+	}
 
 	tx, err := billsDB.Begin(ctx)
 	if err != nil {
@@ -62,16 +70,16 @@ func saveInvoice(ctx context.Context, snap bill.Snapshot) error {
 
 	if _, err := tx.Exec(ctx, `
 		INSERT INTO invoice (
-			bill_id, state, currency, period_start, period_end, created_at,
+			bill_id, customer_id, state, currency, period_start, period_end, created_at,
 			total_minor_units, closed_at, closed_by
-		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
 		ON CONFLICT (bill_id) DO UPDATE SET
 			state             = EXCLUDED.state,
 			total_minor_units = EXCLUDED.total_minor_units,
 			closed_at         = EXCLUDED.closed_at,
 			closed_by         = EXCLUDED.closed_by
 	`,
-		snap.ID, string(snap.State), snap.Currency.Code,
+		snap.ID, snap.CustomerID, string(snap.State), snap.Currency.Code,
 		snap.PeriodStart, snap.PeriodEnd, snap.CreatedAt,
 		snap.Total.MinorUnits(), *snap.ClosedAt, string(snap.ClosedBy),
 	); err != nil {
@@ -126,12 +134,12 @@ func loadInvoice(ctx context.Context, billID string) (bill.Snapshot, error) {
 	)
 
 	row := billsDB.QueryRow(ctx, `
-		SELECT state, currency, period_start, period_end, created_at,
+		SELECT customer_id, state, currency, period_start, period_end, created_at,
 		       total_minor_units, closed_at, closed_by
 		FROM invoice WHERE bill_id = $1
 	`, billID)
 
-	if err := row.Scan(&state, &currencyStr, &snap.PeriodStart, &snap.PeriodEnd,
+	if err := row.Scan(&snap.CustomerID, &state, &currencyStr, &snap.PeriodStart, &snap.PeriodEnd,
 		&snap.CreatedAt, &totalMinor, closedAt, &closedBy); err != nil {
 		if errors.Is(err, sqldb.ErrNoRows) {
 			return bill.Snapshot{}, fmt.Errorf("%w: %q", ErrInvoiceNotFound, billID)

@@ -2,7 +2,13 @@ package billing
 
 import (
 	"context"
+	"net/http/httptest"
+	"strings"
 	"testing"
+	"time"
+
+	"fees-api/internal/bill"
+	"fees-api/internal/money"
 
 	"go.temporal.io/api/serviceerror"
 )
@@ -137,5 +143,62 @@ func TestUnavailableCarriesRetryAfterAndAReason(t *testing.T) {
 	}
 	if reasonUnavailable == reasonNotFound {
 		t.Errorf("the unavailable reason must be distinct from the not-found reason")
+	}
+}
+
+// An error that names the value the caller failed to guess is a lookup with
+// extra steps. Today it leaks nothing, because retrieving a bill reports its
+// customer anyway - but the design expects authentication upstream, and once
+// retrieval starts refusing strangers these messages would keep answering the
+// question retrieval has stopped answering.
+//
+// This guards the property structurally, because the natural instinct when
+// writing an error is to be maximally helpful.
+func TestRefusalsDoNotEchoAnotherPartysData(t *testing.T) {
+	const (
+		theirCustomer = "acme-holdings-gmbh"
+		theirCurrency = "GEL"
+	)
+
+	b, err := bill.New("bill_x", theirCustomer, money.MustLookup("USD"),
+		time.Now(), time.Now().Add(time.Hour), time.Now())
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+
+	_, mismatch := b.AddLineItem(bill.LineItem{
+		ID:          "txn_1",
+		Amount:      money.New(100, money.MustLookup("USD")),
+		Description: "fee",
+	}, "a-wrong-guess")
+	if mismatch == nil {
+		t.Fatal("a wrong customer was accepted")
+	}
+	if strings.Contains(mismatch.Error(), theirCustomer) {
+		t.Errorf("the mismatch error names the bill's real customer:\n  %v\n\n"+
+			"A caller that guesses wrong is handed the right answer.", mismatch)
+	}
+	if !strings.Contains(mismatch.Error(), "bill_x") {
+		t.Errorf("the error should still identify which bill was addressed: %v", mismatch)
+	}
+
+	// The same property for key reuse, which echoed the existing bill's currency
+	// and fee period.
+	rec := httptest.NewRecorder()
+	writeKeyReuse(rec, "bill_x", bill.Snapshot{
+		ID:          "bill_x",
+		CustomerID:  theirCustomer,
+		Currency:    money.MustLookup(theirCurrency),
+		PeriodStart: time.Date(2027, 3, 1, 0, 0, 0, 0, time.UTC),
+		PeriodEnd:   time.Date(2027, 4, 1, 0, 0, 0, 0, time.UTC),
+	})
+	body := rec.Body.String()
+	for _, leaked := range []string{theirCustomer, theirCurrency, "2027-03-01", "2027-04-01"} {
+		if strings.Contains(body, leaked) {
+			t.Errorf("the key-reuse refusal echoes %q from the existing bill:\n  %s", leaked, body)
+		}
+	}
+	if !strings.Contains(body, "bill_x") {
+		t.Errorf("it should still say which bill holds the key: %s", body)
 	}
 }

@@ -30,6 +30,11 @@ const (
 	// the bill. Malformed rather than contradictory: 422.
 	ReasonCurrencyMismatch = "currency_mismatch"
 
+	// ReasonCustomerMismatch means the line item states a customer that is not
+	// the bill's. Like a currency mismatch it is malformed rather than
+	// contradictory: 422.
+	ReasonCustomerMismatch = "customer_mismatch"
+
 	// ReasonInvalidLineItem means the line item is missing required detail: 422.
 	ReasonInvalidLineItem = "invalid_line_item"
 
@@ -55,6 +60,8 @@ func ClassifyRejection(err error) string {
 		return ReasonBillNotOpen
 	case errors.Is(err, bill.ErrLineItemConflict):
 		return ReasonLineItemConflict
+	case errors.Is(err, bill.ErrCustomerMismatch):
+		return ReasonCustomerMismatch
 	case errors.Is(err, money.ErrCurrencyMismatch):
 		return ReasonCurrencyMismatch
 	case errors.Is(err, money.ErrUnsupportedCurrency):
