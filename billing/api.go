@@ -7,17 +7,40 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"time"
 
 	"encore.dev"
+	commonpb "go.temporal.io/api/common/v1"
 	enumspb "go.temporal.io/api/enums/v1"
+	taskqueuepb "go.temporal.io/api/taskqueue/v1"
+	"go.temporal.io/api/workflowservice/v1"
 	"go.temporal.io/sdk/client"
 
 	"fees-api/internal/bill"
 	"fees-api/internal/billflow"
 	"fees-api/internal/money"
 )
+
+// temporalCallTimeout bounds how long an API request waits on Temporal before
+// answering the caller.
+//
+// Without it the SDK retries a transient failure against the request's own
+// context, which has no deadline, so an outage leaves a mutation hanging rather
+// than refusing it - the caller learns nothing and holds a connection open until
+// it gives up. A bounded wait turns that into a 503 the caller can act on.
+//
+// Timing out is safe here precisely because every mutation is idempotent: an
+// update that did apply before the deadline is recognised as already applied when
+// the caller retries, so a premature 503 cannot double-charge a bill.
+const temporalCallTimeout = 10 * time.Second
+
+// temporalContext bounds a Temporal call to temporalCallTimeout, while still
+// cancelling if the client disconnects first.
+func temporalContext(req *http.Request) (context.Context, context.CancelFunc) {
+	return context.WithTimeout(req.Context(), temporalCallTimeout)
+}
 
 // CreateBillRequest opens a bill for a fee period.
 type CreateBillRequest struct {
@@ -31,6 +54,65 @@ type CreateBillRequest struct {
 type AddLineItemRequest struct {
 	Amount      money.Money `json:"amount"`
 	Description string      `json:"description"`
+}
+
+// matchesRequest reports whether an existing bill is the one this request asked
+// for. It is the check that makes an idempotency key safe to reuse by accident:
+// without it, a key reused with different parameters is answered with a bill in
+// the wrong currency, for the wrong period, and the caller is never told.
+//
+// Nothing needs to be stored to do this. The request is exactly a currency and a
+// fee period, and a bill carries all three, so the bill is its own record of what
+// was asked for - which keeps uniqueness coming from Temporal rather than from a
+// deduplication table.
+//
+// Instants are compared with Equal, never ==. The period comes back from the
+// workflow as UTC while a caller may have written the same moment with an offset;
+// == compares wall clock, location and monotonic reading, so it would refuse a
+// correct retry.
+//
+// Both sides are taken to storage precision first. A bill read back from Postgres
+// has lost its sub-microsecond digits, and comparing that against an untruncated
+// request refused a correct retry as key reuse - the same false 409 the Equal
+// rule above exists to prevent, arriving by a different route. Requests are
+// truncated on the way in too, so this is belt and braces for bills created
+// before that was so.
+func matchesRequest(snap bill.Snapshot, currency money.Currency, in CreateBillRequest) bool {
+	return snap.Currency.Code == currency.Code &&
+		atStoragePrecision(snap.PeriodStart).Equal(atStoragePrecision(in.PeriodStart)) &&
+		atStoragePrecision(snap.PeriodEnd).Equal(atStoragePrecision(in.PeriodEnd))
+}
+
+// writeKeyReuse refuses a key that already named a different bill.
+func writeKeyReuse(w http.ResponseWriter, billID string, snap bill.Snapshot) {
+	writeProblem(w, http.StatusConflict, reasonKeyReuse,
+		"idempotency key already created bill "+billID+" in "+snap.Currency.Code+
+			" for "+snap.PeriodStart.UTC().Format(time.RFC3339)+" to "+
+			snap.PeriodEnd.UTC().Format(time.RFC3339)+
+			"; reusing it for different parameters would return a bill that was not asked for")
+}
+
+// validateLineItemRequest reports what is wrong with a charge before it is sent
+// anywhere, or nil if it is well formed.
+//
+// It exists because an absent amount is not caught by decoding. A body with no
+// amount leaves the zero Money, whose currency is empty; that marshals happily
+// onto the update payload and then fails to deserialise on the worker, so the
+// validator never runs and the caller is told the service broke rather than that
+// its request was malformed.
+//
+// Pure, so the rule is testable without a running workflow or a live request.
+func validateLineItemRequest(itemID string, in AddLineItemRequest) error {
+	if itemID == "" {
+		return fmt.Errorf("%w: item id is required", bill.ErrInvalidLineItem)
+	}
+	if in.Amount.Currency().IsZero() {
+		return fmt.Errorf("%w: amount and its currency are required", bill.ErrInvalidLineItem)
+	}
+	if in.Description == "" {
+		return fmt.Errorf("%w: description is required", bill.ErrInvalidLineItem)
+	}
+	return nil
 }
 
 // CreateBill opens a new bill and starts the workflow that owns it.
@@ -48,7 +130,8 @@ type AddLineItemRequest struct {
 //
 //encore:api public raw method=POST path=/bills
 func (s *Service) CreateBill(w http.ResponseWriter, req *http.Request) {
-	ctx := req.Context()
+	ctx, cancel := temporalContext(req)
+	defer cancel()
 
 	var in CreateBillRequest
 	if err := json.NewDecoder(req.Body).Decode(&in); err != nil {
@@ -63,9 +146,25 @@ func (s *Service) CreateBill(w http.ResponseWriter, req *http.Request) {
 			"currency must be one of "+joinCodes(money.Supported()))
 		return
 	}
+	// Before validation, not after: two instants less than a microsecond apart
+	// would otherwise satisfy "strictly after" and then collapse into one another
+	// on the way to storage, leaving a bill whose period does not end after it
+	// begins - which the invoice table's own CHECK constraint forbids.
+	in.PeriodStart = atStoragePrecision(in.PeriodStart)
+	in.PeriodEnd = atStoragePrecision(in.PeriodEnd)
+
 	if !in.PeriodEnd.After(in.PeriodStart) {
 		writeProblem(w, http.StatusUnprocessableEntity, billflow.ReasonInvalidPeriod,
 			"periodEnd must be strictly after periodStart")
+		return
+	}
+	if !in.PeriodEnd.After(time.Now()) {
+		// A bill accrues charges over a period that is still running. One whose
+		// period has ended builds a timer with a negative duration, fires it at
+		// once, and is closing before the caller has read the response saying it
+		// was created - a 201 for a bill that can never take a charge.
+		writeProblem(w, http.StatusUnprocessableEntity, billflow.ReasonInvalidPeriod,
+			"periodEnd is in the past; a bill cannot accrue charges over a period that has already ended")
 		return
 	}
 
@@ -75,32 +174,55 @@ func (s *Service) CreateBill(w http.ResponseWriter, req *http.Request) {
 	// second one. This covers the completed case too, where the workflow is gone
 	// and the invoice is read from storage.
 	if keyed {
-		if snap, err := s.readBill(ctx, billID); err == nil {
+		switch snap, readErr := s.readBill(ctx, billID); {
+		case readErr == nil:
+			if !matchesRequest(snap, currency, in) {
+				writeKeyReuse(w, billID, snap)
+				return
+			}
 			w.Header().Set("Location", "/bills/"+billID)
 			writeJSON(w, http.StatusOK, snap)
+			return
+		case isWorkflowBusy(readErr):
+			// Whether this key already made a bill is unknowable right now.
+			// Starting one anyway risks a second bill for the same key, so the
+			// honest answer is to ask the caller to retry.
+			writeUnavailable(w, "could not determine whether this idempotency key already created a bill: "+readErr.Error())
 			return
 		}
 	}
 
-	_, err = s.temporal.ExecuteWorkflow(ctx, client.StartWorkflowOptions{
-		ID:                       billID,
-		TaskQueue:                billflow.TaskQueue,
-		WorkflowIDReusePolicy:    enumspb.WORKFLOW_ID_REUSE_POLICY_REJECT_DUPLICATE,
-		WorkflowIDConflictPolicy: enumspb.WORKFLOW_ID_CONFLICT_POLICY_USE_EXISTING,
-	}, billflow.BillWorkflow, billflow.StartBillInput{
+	started, err := s.startBillWorkflow(ctx, billID, billflow.StartBillInput{
 		BillID:      billID,
 		Currency:    currency.Code,
 		PeriodStart: in.PeriodStart,
 		PeriodEnd:   in.PeriodEnd,
 	})
 	if err != nil {
-		// The key names a bill that already exists and has finished. Return it.
-		if isWorkflowGone(err) {
-			if snap, readErr := s.readBill(ctx, billID); readErr == nil {
+		// The key names a bill that already exists. Return it rather than a second.
+		if isWorkflowAlreadyStarted(err) {
+			// This request lost the race, or repeats a key that already made a bill.
+			// Either way the bill exists; compare here as well as in the pre-check,
+			// because two concurrent requests can both pass the pre-check before
+			// either has created anything.
+			snap, readErr := s.readBill(ctx, billID)
+			if readErr == nil {
+				if !matchesRequest(snap, currency, in) {
+					writeKeyReuse(w, billID, snap)
+					return
+				}
 				w.Header().Set("Location", "/bills/"+billID)
 				writeJSON(w, http.StatusOK, snap)
 				return
 			}
+			if isWorkflowBusy(readErr) {
+				writeUnavailable(w, "the existing bill for this key could not be read: "+readErr.Error())
+				return
+			}
+		}
+		if isWorkflowBusy(err) {
+			writeUnavailable(w, "the bill could not be started: "+err.Error())
+			return
 		}
 		writeProblem(w, http.StatusInternalServerError, billflow.ReasonInternal,
 			"starting bill workflow: "+err.Error())
@@ -109,13 +231,79 @@ func (s *Service) CreateBill(w http.ResponseWriter, req *http.Request) {
 
 	snap, err := s.readBill(ctx, billID)
 	if err != nil {
+		if isWorkflowBusy(err) {
+			// The bill exists - the start succeeded - but its state cannot be read
+			// back right now. Reporting a fault would tell the caller its bill was
+			// not created, and a caller without an idempotency key that retries on
+			// that basis creates a second one. 503 asks for the retry that will
+			// return the bill, and creation is idempotent so the retry is safe.
+			writeUnavailable(w, "the bill was created but its state could not be read back: "+err.Error())
+			return
+		}
 		writeProblem(w, http.StatusInternalServerError, billflow.ReasonInternal,
 			"reading the new bill: "+err.Error())
 		return
 	}
 
+	// Only the request that actually created the execution reports 201. Without
+	// this, concurrent requests sharing a key all claim to have created the bill.
+	if !started && !matchesRequest(snap, currency, in) {
+		writeKeyReuse(w, billID, snap)
+		return
+	}
+	status := http.StatusOK
+	if started {
+		status = http.StatusCreated
+	}
+
 	w.Header().Set("Location", "/bills/"+billID)
-	writeJSON(w, http.StatusCreated, snap)
+	writeJSON(w, status, snap)
+}
+
+// startBillWorkflow starts a bill's workflow and reports whether this request is
+// the one that created it.
+//
+// It calls the service API directly rather than client.ExecuteWorkflow, because
+// the SDK helper does not surface that fact. Under any conflict policy it returns
+// the existing run handle and a nil error when the workflow is already running,
+// so a caller cannot tell creating from attaching - and every concurrent request
+// sharing an idempotency key then reports 201 Created. The raw response carries a
+// Started flag, which is exactly the missing signal.
+//
+// USE_EXISTING rather than FAIL: attaching is the ordinary outcome of a retry and
+// should not be an error path. REJECT_DUPLICATE still stands, so a key whose bill
+// has completed cannot quietly start a second one.
+func (s *Service) startBillWorkflow(ctx context.Context, billID string, in billflow.StartBillInput) (bool, error) {
+	payload, err := dataConverter.ToPayloads(in)
+	if err != nil {
+		return false, fmt.Errorf("encoding bill workflow input: %w", err)
+	}
+
+	resp, err := s.temporal.WorkflowService().StartWorkflowExecution(ctx,
+		&workflowservice.StartWorkflowExecutionRequest{
+			Namespace:    temporalNamespace(),
+			WorkflowId:   billID,
+			WorkflowType: &commonpb.WorkflowType{Name: billflow.WorkflowTypeName},
+			TaskQueue:    &taskqueuepb.TaskQueue{Name: billflow.TaskQueue},
+			Input:        payload,
+			// Identifies this attempt. Distinct per request, so two concurrent
+			// requests are two attempts and exactly one of them starts the bill; a
+			// shared value would make the server treat them as one retried request.
+			RequestId:                newRequestID(),
+			WorkflowIdReusePolicy:    enumspb.WORKFLOW_ID_REUSE_POLICY_REJECT_DUPLICATE,
+			WorkflowIdConflictPolicy: enumspb.WORKFLOW_ID_CONFLICT_POLICY_USE_EXISTING,
+		})
+	if err != nil {
+		return false, err
+	}
+	return resp.Started, nil
+}
+
+// newRequestID returns a fresh identifier for one start attempt.
+func newRequestID() string {
+	var b [16]byte
+	_, _ = rand.Read(b[:])
+	return hex.EncodeToString(b[:])
 }
 
 // AddLineItem accrues a charge onto an open bill.
@@ -139,7 +327,8 @@ func (s *Service) CreateBill(w http.ResponseWriter, req *http.Request) {
 //
 //encore:api public raw method=PUT path=/bills/:billId/line-items/:itemId
 func (s *Service) AddLineItem(w http.ResponseWriter, req *http.Request) {
-	ctx := req.Context()
+	ctx, cancel := temporalContext(req)
+	defer cancel()
 	billID := pathParam("billId")
 	itemID := pathParam("itemId")
 
@@ -147,6 +336,11 @@ func (s *Service) AddLineItem(w http.ResponseWriter, req *http.Request) {
 	if err := json.NewDecoder(req.Body).Decode(&in); err != nil {
 		writeProblem(w, http.StatusUnprocessableEntity, billflow.ReasonInvalidLineItem,
 			"request body is not a valid line item: "+err.Error())
+		return
+	}
+
+	if err := validateLineItemRequest(itemID, in); err != nil {
+		writeProblem(w, statusForDomainError(err), billflow.ClassifyRejection(err), err.Error())
 		return
 	}
 
@@ -161,13 +355,13 @@ func (s *Service) AddLineItem(w http.ResponseWriter, req *http.Request) {
 		}},
 	})
 	if err != nil {
-		s.writeUpdateFailure(w, billID, err)
+		s.writeAddFailure(w, ctx, billID, itemID, in, err)
 		return
 	}
 
 	var result bill.AddResult
 	if err := handle.Get(ctx, &result); err != nil {
-		s.writeUpdateFailure(w, billID, err)
+		s.writeAddFailure(w, ctx, billID, itemID, in, err)
 		return
 	}
 
@@ -196,7 +390,8 @@ func (s *Service) AddLineItem(w http.ResponseWriter, req *http.Request) {
 //
 //encore:api public raw method=POST path=/bills/:billId/close
 func (s *Service) CloseBill(w http.ResponseWriter, req *http.Request) {
-	ctx := req.Context()
+	ctx, cancel := temporalContext(req)
+	defer cancel()
 	billID := pathParam("billId")
 
 	handle, err := s.temporal.UpdateWorkflow(ctx, client.UpdateWorkflowOptions{
@@ -218,17 +413,26 @@ func (s *Service) CloseBill(w http.ResponseWriter, req *http.Request) {
 
 	// The workflow has already finished, so the bill is closed and its invoice
 	// lives in storage. That still satisfies the request.
-	if isWorkflowGone(err) {
+	if isWorkflowBusy(err) {
+		writeUnavailable(w, "the bill could not be reached to close it: "+err.Error())
+		return
+	}
+	if isWorkflowAbsent(err) {
 		snap, readErr := loadInvoice(ctx, billID)
-		if readErr == nil {
+		switch {
+		case readErr == nil:
 			w.Header().Set("Location", "/bills/"+billID)
 			writeJSON(w, http.StatusAccepted, snap)
-			return
-		}
-		if errors.Is(readErr, ErrInvoiceNotFound) {
+		case errors.Is(readErr, ErrInvoiceNotFound):
+			// Neither source has the bill, so it really is absent.
 			writeNotFound(w, billID)
-			return
+		default:
+			// Storage failed. Falling through here reported a database outage as a
+			// missing bill, which reads as "this never existed" and pages nobody.
+			writeProblem(w, http.StatusInternalServerError, billflow.ReasonInternal,
+				"reading the invoice for bill "+billID+": "+readErr.Error())
 		}
+		return
 	}
 	s.writeUpdateFailure(w, billID, err)
 }
@@ -243,13 +447,23 @@ func (s *Service) CloseBill(w http.ResponseWriter, req *http.Request) {
 //
 //encore:api public raw method=GET path=/bills/:billId
 func (s *Service) GetBill(w http.ResponseWriter, req *http.Request) {
-	snap, err := s.readBill(req.Context(), pathParam("billId"))
+	billID := pathParam("billId")
+
+	ctx, cancel := temporalContext(req)
+	defer cancel()
+
+	snap, err := s.readBill(ctx, billID)
 	if err != nil {
-		if errors.Is(err, ErrInvoiceNotFound) {
-			writeNotFound(w, pathParam("billId"))
-			return
+		switch {
+		case errors.Is(err, ErrInvoiceNotFound):
+			// Both sources were asked and neither had the bill. This is the only
+			// circumstance in which "not found" is true.
+			writeNotFound(w, billID)
+		case isWorkflowBusy(err):
+			writeUnavailable(w, "the bill's state could not be read: "+err.Error())
+		default:
+			writeProblem(w, http.StatusInternalServerError, billflow.ReasonInternal, err.Error())
 		}
-		writeProblem(w, http.StatusInternalServerError, billflow.ReasonInternal, err.Error())
 		return
 	}
 	writeJSON(w, http.StatusOK, snap)
@@ -259,23 +473,97 @@ func (s *Service) GetBill(w http.ResponseWriter, req *http.Request) {
 // workflow first, then durable storage.
 func (s *Service) readBill(ctx context.Context, billID string) (bill.Snapshot, error) {
 	ev, err := s.temporal.QueryWorkflow(ctx, billID, "", billflow.QueryGetBill)
-	if err == nil {
+	switch {
+	case err == nil:
 		var snap bill.Snapshot
-		if decodeErr := ev.Get(&snap); decodeErr == nil {
-			return snap, nil
+		if decodeErr := ev.Get(&snap); decodeErr != nil {
+			// Previously discarded, which turned a malformed answer into a missing
+			// bill. A workflow that answers unintelligibly is a fault, not an absence.
+			return bill.Snapshot{}, fmt.Errorf("billing: decoding bill %q from its workflow: %w", billID, decodeErr)
 		}
+		return snap, nil
+
+	case isWorkflowAbsent(err):
+		// The only condition under which storage is the right place to look: there
+		// is no live execution to ask, so the persisted invoice is all there is.
+		return loadInvoice(ctx, billID)
+
+	default:
+		// Everything else - unreachable, busy, overloaded, or an outright fault -
+		// propagates. Falling back here is what made a Temporal outage look like
+		// every open bill having been deleted.
+		return bill.Snapshot{}, fmt.Errorf("billing: querying bill %q: %w", billID, err)
 	}
-	return loadInvoice(ctx, billID)
 }
 
-// writeUpdateFailure reports an update that did not apply. A workflow that no
-// longer exists is a missing bill, not an internal fault.
+// writeUpdateFailure reports an update that did not apply.
 func (s *Service) writeUpdateFailure(w http.ResponseWriter, billID string, err error) {
-	if isWorkflowGone(err) {
+	switch {
+	case isWorkflowBusy(err):
+		writeUnavailable(w, "the bill could not be reached: "+err.Error())
+	case isWorkflowAbsent(err):
 		writeNotFound(w, billID)
+	default:
+		writeRejection(w, err)
+	}
+}
+
+// writeAddFailure answers a charge the workflow could not take.
+//
+// A bill's workflow finishes within seconds of the bill closing, and stays
+// finished for the rest of the bill's life - so "no live execution" is the
+// ordinary condition of a closed bill, not an exotic one. Treating it as a
+// missing bill answered 404 for a charge on a bill that GET returns 200 for, and
+// a caller told its charge was refused as unknown may compensate for money that
+// is genuinely on the invoice.
+//
+// So the persisted invoice is consulted, exactly as CloseBill already does, and
+// the answer comes from the same domain rule the live path applies.
+func (s *Service) writeAddFailure(w http.ResponseWriter, ctx context.Context, billID, itemID string, in AddLineItemRequest, err error) {
+	if !isWorkflowAbsent(err) {
+		s.writeUpdateFailure(w, billID, err)
 		return
 	}
-	writeRejection(w, err)
+
+	snap, loadErr := loadInvoice(ctx, billID)
+	if loadErr != nil {
+		if errors.Is(loadErr, ErrInvoiceNotFound) {
+			// Neither the workflow nor storage has this bill. Now 404 is true.
+			writeNotFound(w, billID)
+			return
+		}
+		writeProblem(w, http.StatusInternalServerError, billflow.ReasonInternal,
+			"reading the invoice for bill "+billID+": "+loadErr.Error())
+		return
+	}
+
+	existing, checkErr := bill.CheckAgainstSnapshot(snap, bill.LineItem{
+		ID:          itemID,
+		Amount:      in.Amount,
+		Description: in.Description,
+	})
+	if checkErr != nil {
+		writeProblem(w, statusForDomainError(checkErr), billflow.ClassifyRejection(checkErr), checkErr.Error())
+		return
+	}
+
+	// The charge is already on the invoice, so the retry succeeded the first time.
+	w.Header().Set("Location", "/bills/"+billID+"/line-items/"+itemID)
+	writeJSON(w, http.StatusOK, bill.AddResult{
+		Outcome:      bill.OutcomeAlreadyAccrued,
+		LineItem:     *existing,
+		RunningTotal: snap.Total,
+	})
+}
+
+// statusForDomainError maps a domain error to its status using the same table
+// the workflow's rejections go through, so a charge refused from storage and the
+// same charge refused by the workflow answer identically.
+func statusForDomainError(err error) int {
+	if status, ok := reasonStatus[billflow.ClassifyRejection(err)]; ok {
+		return status
+	}
+	return http.StatusInternalServerError
 }
 
 // pathParam reads a path parameter from the in-flight Encore request.

@@ -8,13 +8,23 @@ import (
 	"encore.dev/rlog"
 	"go.temporal.io/sdk/activity"
 	"go.temporal.io/sdk/client"
+	"go.temporal.io/sdk/converter"
 	"go.temporal.io/sdk/worker"
+	"go.temporal.io/sdk/workflow"
 
 	"fees-api/internal/billflow"
 )
 
 // defaultTemporalHostPort is the address of a local `temporal server start-dev`.
 const defaultTemporalHostPort = "127.0.0.1:7233"
+
+// dataConverter encodes everything crossing the boundary to Temporal.
+//
+// It is named once and shared, because bill creation starts its workflow through
+// the raw service API and must encode that input itself. Were the client
+// configured with one converter and the start request encoded with another, the
+// workflow would receive input it could not read.
+var dataConverter = converter.GetDefaultDataConverter()
 
 // Service holds the Temporal client the API endpoints use and the worker that
 // executes bill workflows.
@@ -62,16 +72,20 @@ func initService() (*Service, error) {
 	// A lazy client defers the connection until first use, so startup does not
 	// depend on Temporal being reachable at exactly that instant.
 	c, err := client.NewLazyClient(client.Options{
-		HostPort:  hostPort,
-		Namespace: namespace,
-		Logger:    temporalLogger{},
+		HostPort:      hostPort,
+		Namespace:     namespace,
+		Logger:        temporalLogger{},
+		DataConverter: dataConverter,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("billing: creating Temporal client for %s: %w", hostPort, err)
 	}
 
 	w := worker.New(c, billflow.TaskQueue, worker.Options{})
-	w.RegisterWorkflow(billflow.BillWorkflow)
+	// Registered under an explicit name, the same constant the start request
+	// names, so a rename of the Go function cannot silently orphan running bills.
+	w.RegisterWorkflowWithOptions(billflow.BillWorkflow,
+		workflow.RegisterOptions{Name: billflow.WorkflowTypeName})
 
 	acts := &Activities{}
 	// Activities are registered under explicit names. The workflow refers to them

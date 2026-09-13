@@ -35,6 +35,15 @@ import (
 // TaskQueue is the queue the bill workflow and its activities run on.
 const TaskQueue = "fees-api-bills"
 
+// WorkflowTypeName is the name the bill workflow is registered under, and the
+// name a start request must ask for.
+//
+// It is a constant because bill creation starts the workflow through the raw
+// service API rather than the SDK helper, and so has to name the type itself.
+// Registration uses this same constant, so the two cannot drift - and it matches
+// the type recorded in the committed replay fixtures, which must keep replaying.
+const WorkflowTypeName = "BillWorkflow"
+
 // Update, query, and activity names. They are part of the workflow's contract
 // with its callers and its worker, so they are named constants rather than
 // literals scattered across the codebase.
@@ -158,19 +167,22 @@ func BillWorkflow(ctx workflow.Context, in StartBillInput) (bill.Snapshot, error
 	// beginClose is the single place the bill's state changes to CLOSING. Both
 	// triggers route through it, and it is a no-op once the bill has left OPEN,
 	// so whichever arrives second changes nothing.
-	beginClose := func(trigger bill.Trigger) bill.Snapshot {
+	beginClose := func(trigger bill.Trigger) (bill.Snapshot, error) {
 		snap, closeErr := b.Close(trigger, workflow.Now(ctx))
 		if closeErr != nil {
-			// Close only errors on an impossible transition, which the state
-			// machine table rules out from OPEN.
+			// Unreachable today: Close errors only on a transition the state table
+			// forbids, and it cannot be reached from OPEN. Returned rather than
+			// logged all the same, because swallowing it answered 202 Accepted with
+			// a snapshot still reading OPEN - telling a caller its bill was closing
+			// when nothing had happened.
 			logger.Error("closing bill failed", "billID", b.ID(), "error", closeErr)
-			return b.Snapshot()
+			return bill.Snapshot{}, closeErr
 		}
 		if !closeSignalled {
 			closeSignalled = true
 			requestClose.Set(nil, nil)
 		}
-		return snap
+		return snap, nil
 	}
 
 	// Handlers are registered before the first yield so that updates delivered
@@ -218,7 +230,7 @@ func BillWorkflow(ctx workflow.Context, in StartBillInput) (bill.Snapshot, error
 		// closed and it is - so it returns the frozen invoice with the trigger
 		// that actually caused the close, rather than an error.
 		func(ctx workflow.Context, _ CloseBillInput) (bill.Snapshot, error) {
-			return beginClose(bill.TriggerAPIRequest), nil
+			return beginClose(bill.TriggerAPIRequest)
 		},
 		workflow.UpdateHandlerOptions{})
 	if err != nil {
@@ -229,13 +241,32 @@ func BillWorkflow(ctx workflow.Context, in StartBillInput) (bill.Snapshot, error
 	// Temporal timer built from workflow.Now - never time.Now, which would be
 	// non-deterministic on replay and would break every in-flight bill the moment
 	// a worker restarted.
-	periodTimer := workflow.NewTimer(ctx, b.PeriodEnd().Sub(workflow.Now(ctx)))
+	// Clamped at zero. A period already past yields a negative duration, and while
+	// the API refuses such a period, the workflow must not depend on that: a bill
+	// started by any other route should close at once rather than on a timer whose
+	// duration is meaningless.
+	untilPeriodEnd := b.PeriodEnd().Sub(workflow.Now(ctx))
+	if untilPeriodEnd < 0 {
+		untilPeriodEnd = 0
+	}
+	periodTimer := workflow.NewTimer(ctx, untilPeriodEnd)
+
+	// A failure to close at period end cannot be swallowed here. The timer has
+	// already fired and there is no second one, so the Await below would block
+	// forever: the bill would sit OPEN past the end of its period, still taking
+	// charges, never invoiced and never persisted. It is carried out of the
+	// callback and fails the workflow instead, which is visible and alertable
+	// where an eternal wait is neither.
+	var periodEndCloseErr error
 
 	selector := workflow.NewSelector(ctx)
 	selector.AddFuture(periodTimer, func(workflow.Future) {
 		// Guarded, because an early close may already have won this race.
 		if b.State() == bill.StateOpen {
-			beginClose(bill.TriggerPeriodEnd)
+			if _, closeErr := beginClose(bill.TriggerPeriodEnd); closeErr != nil {
+				logger.Error("period-end close failed", "billID", b.ID(), "error", closeErr)
+				periodEndCloseErr = closeErr
+			}
 		}
 	})
 	selector.AddFuture(closeRequested, func(workflow.Future) {
@@ -243,6 +274,11 @@ func BillWorkflow(ctx workflow.Context, in StartBillInput) (bill.Snapshot, error
 		// end the wait.
 	})
 	selector.Select(ctx)
+
+	if periodEndCloseErr != nil {
+		return bill.Snapshot{}, temporal.NewNonRetryableApplicationError(
+			periodEndCloseErr.Error(), ClassifyRejection(periodEndCloseErr), periodEndCloseErr)
+	}
 
 	// Belt and braces: the selector woke us, but the bill is only genuinely
 	// closed once its state says so.

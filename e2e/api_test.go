@@ -21,6 +21,7 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"sync"
 	"testing"
 	"time"
 )
@@ -71,19 +72,35 @@ func (r response) totalMinorUnits(t *testing.T) int64 {
 
 func do(t *testing.T, method, path string, body any, headers map[string]string) response {
 	t.Helper()
+	r, err := request(method, path, body, headers)
+	if err != nil {
+		t.Fatalf("%s %s: %v", method, path, err)
+	}
+	return r
+}
 
+// request performs a call and returns a transport failure rather than ending the
+// test.
+//
+// A goroutine must use this, never do(). t.Fatalf stops a test by killing the
+// goroutine it runs on, which is right from the test goroutine and wrong from a
+// spawned one: there it ends that goroutine quietly, the waitgroup still
+// completes, and the test carries on to report a missing result as though the
+// assertion had failed. A refused connection then reads as a lost write, and
+// whoever investigates goes looking for a concurrency defect that is not there.
+func request(method, path string, body any, headers map[string]string) (response, error) {
 	var reader io.Reader
 	if body != nil {
 		b, err := json.Marshal(body)
 		if err != nil {
-			t.Fatalf("encoding request: %v", err)
+			return response{}, fmt.Errorf("encoding request: %w", err)
 		}
 		reader = bytes.NewReader(b)
 	}
 
 	req, err := http.NewRequest(method, baseURL+path, reader)
 	if err != nil {
-		t.Fatalf("building request: %v", err)
+		return response{}, fmt.Errorf("building request: %w", err)
 	}
 	req.Header.Set("Content-Type", "application/json")
 	for k, v := range headers {
@@ -92,33 +109,53 @@ func do(t *testing.T, method, path string, body any, headers map[string]string) 
 
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
-		t.Fatalf("%s %s: %v", method, path, err)
+		return response{}, err
 	}
 	defer resp.Body.Close()
 
 	raw, _ := io.ReadAll(resp.Body)
 	out := response{status: resp.StatusCode, headers: resp.Header, raw: raw}
 	_ = json.Unmarshal(raw, &out.body)
-	return out
+	return out, nil
 }
 
 // createBill opens a bill whose period runs for the given duration.
+//
+// Each call reads the clock afresh, so two calls describe two different fee
+// periods. That is fine for creating unrelated bills, but it must not be used to
+// model a retry: a repeat carrying the same idempotency key and a period a few
+// milliseconds different is a different request, and is refused as key reuse.
+// Use createBillBody for a retry, which resends identical bytes the way a client
+// retrying a failed call actually would.
 func createBill(t *testing.T, currency string, period time.Duration, headers map[string]string) response {
 	t.Helper()
+	return do(t, http.MethodPost, "/bills", createBillBody(currency, period), headers)
+}
+
+// createBillBody builds a creation request that can be sent more than once.
+func createBillBody(currency string, period time.Duration) map[string]any {
 	now := time.Now().UTC()
-	return do(t, http.MethodPost, "/bills", map[string]any{
+	return map[string]any{
 		"currency":    currency,
 		"periodStart": now.Format(time.RFC3339Nano),
 		"periodEnd":   now.Add(period).Format(time.RFC3339Nano),
-	}, headers)
+	}
 }
 
 func addItem(t *testing.T, billID, itemID string, minorUnits int64, currency, desc string) response {
 	t.Helper()
-	return do(t, http.MethodPut, "/bills/"+billID+"/line-items/"+itemID, map[string]any{
+	return do(t, http.MethodPut, lineItemPath(billID, itemID), lineItemBody(minorUnits, currency, desc), nil)
+}
+
+func lineItemPath(billID, itemID string) string {
+	return "/bills/" + billID + "/line-items/" + itemID
+}
+
+func lineItemBody(minorUnits int64, currency, desc string) map[string]any {
+	return map[string]any{
 		"amount":      map[string]any{"minorUnits": minorUnits, "currency": currency},
 		"description": desc,
-	}, nil)
+	}
 }
 
 func billIDOf(t *testing.T, r response) string {
@@ -145,6 +182,195 @@ func waitForState(t *testing.T, billID, want string, within time.Duration) respo
 	t.Fatalf("bill %s did not reach %s within %s; last state was %v (%s)",
 		billID, want, within, last.body["state"], last.raw)
 	return last
+}
+
+// --- 1.3 to 1.6: defects pinned before their fixes --------------------------
+//
+// These fail today. They document defects found reviewing the initial commit,
+// so that the fixes in groups 4 and 5 are verified by something durable and
+// executed rather than by an ad-hoc request - which is how the defect they sit
+// alongside survived in the first place.
+
+// 1.3 A body carrying no amount decodes to a zero Money whose currency is empty.
+// Nothing validates it before dispatch, and the update argument then fails to
+// deserialise on the worker, so the validator never runs and the caller is told
+// the service broke rather than that its request was malformed.
+func TestLineItemWithoutAmountIsRejectedAsMalformed(t *testing.T) {
+	requireAPI(t)
+
+	billID := billIDOf(t, createBill(t, "USD", time.Hour, nil))
+
+	got := do(t, http.MethodPut, "/bills/"+billID+"/line-items/txn_no_amount",
+		map[string]any{"description": "fee with no amount"}, nil)
+
+	if got.status != http.StatusUnprocessableEntity {
+		t.Fatalf("status = %d, want 422 (%s)\n\n"+
+			"A 500 here means the amount reached the worker unvalidated and failed to "+
+			"deserialise, so the rejection never happened in the validator where it belongs.",
+			got.status, got.raw)
+	}
+	if got.reason() != "invalid_line_item" {
+		t.Errorf("reason = %q, want invalid_line_item", got.reason())
+	}
+}
+
+// 1.4 Under CONFLICT_POLICY_USE_EXISTING a start that attaches to a running
+// execution returns no error, so the handler cannot tell creating from
+// attaching and every concurrent request claims to have created the bill.
+func TestConcurrentCreationsSharingAKeyReportOneCreation(t *testing.T) {
+	requireAPI(t)
+
+	const attempts = 4
+	key := fmt.Sprintf("concurrent-%d", time.Now().UnixNano())
+	headers := map[string]string{"Idempotency-Key": key}
+
+	// One body shared by every goroutine: this tests concurrent retries of the
+	// same request, not four different requests wearing one key.
+	body := createBillBody("USD", time.Hour)
+
+	var (
+		wg      sync.WaitGroup
+		mu      sync.Mutex
+		results = make([]response, 0, attempts)
+		errs    []error
+	)
+	for i := 0; i < attempts; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			r, err := request(http.MethodPost, "/bills", body, headers)
+			mu.Lock()
+			defer mu.Unlock()
+			if err != nil {
+				errs = append(errs, err)
+				return
+			}
+			results = append(results, r)
+		}()
+	}
+	wg.Wait()
+
+	// Reported here, on the test goroutine, so a refused connection is named as
+	// one instead of surfacing as a missing result below.
+	for _, err := range errs {
+		t.Errorf("request failed: %v", err)
+	}
+	if len(errs) > 0 {
+		t.Fatalf("%d of %d requests did not complete; the counts below would be misleading", len(errs), attempts)
+	}
+
+	created, existing, ids := 0, 0, map[string]bool{}
+	for _, r := range results {
+		switch r.status {
+		case http.StatusCreated:
+			created++
+		case http.StatusOK:
+			existing++
+		default:
+			t.Errorf("unexpected status %d (%s)", r.status, r.raw)
+		}
+		if id, ok := r.body["id"].(string); ok {
+			ids[id] = true
+		}
+	}
+
+	if created != 1 {
+		t.Errorf("%d requests reported 201 Created, want exactly 1 (%d reported 200)\n\n"+
+			"Every concurrent request claiming creation means a caller counting 201s "+
+			"believes several bills exist for one key.", created, existing)
+	}
+	if len(ids) != 1 {
+		t.Errorf("requests returned %d distinct bill ids, want 1: %v", len(ids), ids)
+	}
+}
+
+// 1.5 The idempotency pre-check returns the bill a key already created without
+// comparing it against what was asked for, so a key reused by accident is
+// answered with a bill in the wrong currency, for the wrong period.
+func TestKeyReusedWithDifferentParametersIsRejected(t *testing.T) {
+	requireAPI(t)
+
+	headers := map[string]string{"Idempotency-Key": fmt.Sprintf("reuse-%d", time.Now().UnixNano())}
+
+	first := createBill(t, "USD", time.Hour, headers)
+	if first.status != http.StatusCreated {
+		t.Fatalf("first creation = %d, want 201 (%s)", first.status, first.raw)
+	}
+
+	now := time.Now().UTC().Add(720 * time.Hour)
+	second := do(t, http.MethodPost, "/bills", map[string]any{
+		"currency":    "GEL",
+		"periodStart": now.Format(time.RFC3339Nano),
+		"periodEnd":   now.Add(time.Hour).Format(time.RFC3339Nano),
+	}, headers)
+
+	if second.status != http.StatusConflict {
+		t.Fatalf("status = %d, want 409 (%s)\n\n"+
+			"A 200 here returns a USD bill to a caller that asked for a GEL one, for a "+
+			"different period. It will then accrue GEL charges that are all rejected 422, "+
+			"with nothing explaining why.", second.status, second.raw)
+	}
+}
+
+// The same key with the same period stated in another time zone denotes the same
+// instant and must still be a retry. Comparing with == rather than time.Equal
+// would reject a correct request - a false 409, worse than the defect above.
+func TestKeyReuseComparesInstantsNotRepresentations(t *testing.T) {
+	requireAPI(t)
+
+	headers := map[string]string{"Idempotency-Key": fmt.Sprintf("tz-%d", time.Now().UnixNano())}
+
+	start := time.Now().UTC().Truncate(time.Second)
+	end := start.Add(time.Hour)
+
+	first := do(t, http.MethodPost, "/bills", map[string]any{
+		"currency":    "USD",
+		"periodStart": start.Format(time.RFC3339),
+		"periodEnd":   end.Format(time.RFC3339),
+	}, headers)
+	if first.status != http.StatusCreated {
+		t.Fatalf("first creation = %d, want 201 (%s)", first.status, first.raw)
+	}
+
+	elsewhere := time.FixedZone("UTC+4", 4*60*60)
+	second := do(t, http.MethodPost, "/bills", map[string]any{
+		"currency":    "USD",
+		"periodStart": start.In(elsewhere).Format(time.RFC3339),
+		"periodEnd":   end.In(elsewhere).Format(time.RFC3339),
+	}, headers)
+
+	if second.status != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (%s)\n\n"+
+			"The same instant written with a different offset is the same fee period. "+
+			"Rejecting it refuses a correct retry.", second.status, second.raw)
+	}
+}
+
+// 1.6 Creation checks only that periodEnd follows periodStart, never that it is
+// still ahead. A period that has already ended builds a timer with a negative
+// duration, which fires at once, so the bill is closing before the caller has
+// read the response that says it was created.
+func TestFeePeriodAlreadyEndedIsRejected(t *testing.T) {
+	requireAPI(t)
+
+	start := time.Now().UTC().Add(-720 * time.Hour)
+	got := do(t, http.MethodPost, "/bills", map[string]any{
+		"currency":    "USD",
+		"periodStart": start.Format(time.RFC3339Nano),
+		"periodEnd":   start.Add(24 * time.Hour).Format(time.RFC3339Nano),
+	}, map[string]string{"Idempotency-Key": fmt.Sprintf("past-%d", time.Now().UnixNano())})
+
+	if got.status != http.StatusUnprocessableEntity {
+		t.Fatalf("status = %d with state %v, want 422 (%s)\n\n"+
+			"A 201 carrying state CLOSING reports success for a bill that can never "+
+			"accept a charge.", got.status, got.body["state"], got.raw)
+	}
+	if got.reason() != "invalid_period" {
+		t.Errorf("reason = %q, want invalid_period", got.reason())
+	}
+	if id, ok := got.body["id"].(string); ok && id != "" {
+		t.Errorf("a bill was created (%s) for a period that had already ended", id)
+	}
 }
 
 // --- 10.1 ------------------------------------------------------------------
@@ -220,14 +446,18 @@ func TestCreateBillIsIdempotentByKey(t *testing.T) {
 	key := fmt.Sprintf("key-%d", time.Now().UnixNano())
 	headers := map[string]string{"Idempotency-Key": key}
 
-	first := createBill(t, "USD", time.Hour, headers)
+	// One body, sent three times, as a retrying client would send it.
+	body := createBillBody("USD", time.Hour)
+
+	first := do(t, http.MethodPost, "/bills", body, headers)
 	if first.status != http.StatusCreated {
 		t.Fatalf("first POST /bills = %d, want 201 (%s)", first.status, first.raw)
 	}
 	billID := billIDOf(t, first)
 
-	// The bill is still open, so the conflict policy returns the running one.
-	second := createBill(t, "USD", time.Hour, headers)
+	// The bill is still open, so the start attaches to the running execution and
+	// reports that it did not create it.
+	second := do(t, http.MethodPost, "/bills", body, headers)
 	if second.status != http.StatusOK {
 		t.Fatalf("repeat POST /bills while open = %d, want 200 (%s)", second.status, second.raw)
 	}
@@ -242,7 +472,7 @@ func TestCreateBillIsIdempotentByKey(t *testing.T) {
 	}
 	waitForState(t, billID, "CLOSED", 30*time.Second)
 
-	third := createBill(t, "USD", time.Hour, headers)
+	third := do(t, http.MethodPost, "/bills", body, headers)
 	if third.status != http.StatusOK {
 		t.Fatalf("repeat POST /bills after close = %d, want 200 (%s)", third.status, third.raw)
 	}
@@ -315,12 +545,40 @@ func TestAddLineItemStatusMatrix(t *testing.T) {
 		if r := do(t, http.MethodPost, "/bills/"+billID+"/close", nil, nil); r.status != http.StatusAccepted {
 			t.Fatalf("close = %d, want 202", r.status)
 		}
+
+		// Wait for CLOSED before offering the late charge.
+		//
+		// Without this the request lands in the brief CLOSING window, where the
+		// workflow is still running and its validator answers the update - the one
+		// state in which the rejection is correct. Every real client meets the bill
+		// after its workflow has completed, and this test must meet it there too.
+		waitForState(t, billID, "CLOSED", 30*time.Second)
+
 		got := addItem(t, billID, "txn_late", 700, "USD", "late fee")
 		if got.status != http.StatusConflict {
-			t.Fatalf("status = %d, want 409 (%s)", got.status, got.raw)
+			t.Fatalf("status = %d, want 409 (%s)\n\n"+
+				"A 404 here means the bill's completed workflow was read as the bill not "+
+				"existing. GET on this same id answers 200 with the invoice, so the charge "+
+				"is being refused as unknown rather than as too late.", got.status, got.raw)
 		}
 		if got.reason() != "bill_not_open" {
 			t.Errorf("reason = %q, want bill_not_open", got.reason())
+		}
+	})
+
+	// Spec: billing/line-item-accrual - "Retry of an invoiced charge after the
+	// closing process has finished". The 200 above was answered by the running
+	// workflow; this one has to be answered from the invoice, because no live
+	// execution remains. A caller retrying after a timeout must be told the charge
+	// is present, not that the bill is unknown - otherwise it may compensate for
+	// money that is genuinely on the invoice.
+	t.Run("200 for a retry of an invoiced charge once the workflow has finished", func(t *testing.T) {
+		got := addItem(t, billID, "txn_1", 500, "USD", "card fee")
+		if got.status != http.StatusOK {
+			t.Fatalf("status = %d, want 200 (%s)", got.status, got.raw)
+		}
+		if outcome, _ := got.body["outcome"].(string); outcome != "already_accrued" {
+			t.Errorf("outcome = %q, want already_accrued", outcome)
 		}
 	})
 
@@ -330,6 +588,98 @@ func TestAddLineItemStatusMatrix(t *testing.T) {
 			t.Fatalf("status = %d, want 404 (%s)", got.status, got.raw)
 		}
 	})
+}
+
+// Spec: billing/line-item-accrual - "Simultaneous additions are all retained".
+//
+// This is the claim the whole design rests on, and until now it was asserted in
+// prose and exercised nowhere. A workflow executes as a single-threaded
+// deterministic coroutine scheduler, so concurrent additions to one bill are
+// ordered by construction - no row lock, no optimistic-concurrency retry, no lost
+// update. The domain cannot demonstrate that, because Bill is deliberately not
+// safe for concurrent use: serialising writes is the workflow's job, so the proof
+// has to come through the real API against a real worker.
+//
+// Distinct amounts make a lost update visible rather than merely possible: a
+// dropped write changes the total by a unique value, so the failure names itself.
+func TestConcurrentLineItemsAreAllRetained(t *testing.T) {
+	requireAPI(t)
+
+	billID := billIDOf(t, createBill(t, "USD", time.Hour, nil))
+
+	const items = 24
+	var (
+		wg       sync.WaitGroup
+		mu       sync.Mutex
+		statuses = map[int]int{}
+		errs     []error
+		wantSum  int64
+	)
+	for i := 0; i < items; i++ {
+		amount := int64(100 + i) // distinct, so a lost write is identifiable
+		wantSum += amount
+		wg.Add(1)
+		go func(i int, amount int64) {
+			defer wg.Done()
+			r, err := request(http.MethodPut,
+				lineItemPath(billID, fmt.Sprintf("txn_%02d", i)),
+				lineItemBody(amount, "USD", "concurrent fee"), nil)
+			mu.Lock()
+			defer mu.Unlock()
+			if err != nil {
+				errs = append(errs, err)
+				return
+			}
+			statuses[r.status]++
+		}(i, amount)
+	}
+	wg.Wait()
+
+	// A request that never completed is an infrastructure failure, not a lost
+	// write. Saying so here stops the assertions below blaming the workflow for
+	// a charge that was never delivered to it.
+	for _, err := range errs {
+		t.Errorf("request failed: %v", err)
+	}
+	if len(errs) > 0 {
+		t.Fatalf("%d of %d additions did not reach the API; the totals below would "+
+			"report a lost write where the charge was never sent", len(errs), items)
+	}
+
+	if got := statuses[http.StatusCreated]; got != items {
+		t.Errorf("%d additions reported 201, want %d (all statuses: %v)", got, items, statuses)
+	}
+
+	final := do(t, http.MethodGet, "/bills/"+billID, nil, nil)
+	if final.status != http.StatusOK {
+		t.Fatalf("GET = %d, want 200 (%s)", final.status, final.raw)
+	}
+
+	lineItems, _ := final.body["lineItems"].([]any)
+	if len(lineItems) != items {
+		t.Errorf("bill carries %d line items, want %d: a concurrent write was lost", len(lineItems), items)
+	}
+
+	seen := map[string]bool{}
+	for _, raw := range lineItems {
+		if item, ok := raw.(map[string]any); ok {
+			id, _ := item["id"].(string)
+			if seen[id] {
+				t.Errorf("line item %q appears more than once", id)
+			}
+			seen[id] = true
+		}
+	}
+	for i := 0; i < items; i++ {
+		if id := fmt.Sprintf("txn_%02d", i); !seen[id] {
+			t.Errorf("line item %q is missing from the bill", id)
+		}
+	}
+
+	if got := final.totalMinorUnits(t); got != wantSum {
+		t.Errorf("total = %d minor units, want %d: the total is not the exact sum of "+
+			"every charge, so a concurrent write was lost or double-counted", got, wantSum)
+	}
 }
 
 // --- 6.3 -------------------------------------------------------------------

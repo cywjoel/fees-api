@@ -67,3 +67,113 @@ jobs:
 
       - name: Run Encore tests
         run: encore test ./...
+
+  # The end-to-end suite, against a real service.
+  #
+  # It existed from the first commit and guarded nothing: every case is skipped
+  # unless FEES_API_BASE_URL is set, which no job set. One of those skipped cases
+  # asserted the status a charge on a closed bill must get, and the service was
+  # answering 404 where it asserted 409 - a defect the suite would have caught on
+  # the first push had it ever run. Hence this job.
+  e2e:
+    name: End-to-end
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.26'
+          cache: true
+
+      - name: Install Encore
+        run: |
+          curl -L https://encore.dev/install.sh | bash
+          echo "$HOME/.encore/bin" >> "$GITHUB_PATH"
+
+      - name: Install the Temporal CLI
+        run: |
+          curl -sSf https://temporal.download/cli.sh | sh
+          echo "$HOME/.temporalio/bin" >> "$GITHUB_PATH"
+
+      - name: Start the Temporal dev server
+        run: |
+          # nohup and disown, not a bare &. Each run block is its own shell, and a
+          # backgrounded child that is still attached to it can be signalled when
+          # that shell exits - leaving nothing on :7233 by the next step, where the
+          # symptom is the API refusing to boot and the cause looks like an
+          # application fault rather than a job-orchestration one.
+          nohup temporal server start-dev --headless --ip 127.0.0.1 --port 7233 \
+            --db-filename /tmp/temporal-ci.db > /tmp/temporal.log 2>&1 &
+          echo $! > /tmp/temporal.pid
+          disown
+
+          for i in $(seq 1 60); do
+            if temporal operator cluster health --address 127.0.0.1:7233 >/dev/null 2>&1; then
+              echo "temporal ready after ${i}s (pid $(cat /tmp/temporal.pid))"; exit 0
+            fi
+            sleep 1
+          done
+          echo "temporal did not become healthy:"; tail -40 /tmp/temporal.log; exit 1
+
+      - name: Start the API
+        run: |
+          # The server has to have outlived the step that started it. Checking
+          # explicitly names the failure here rather than letting it surface three
+          # steps later as a connection refused inside initService.
+          if ! kill -0 "$(cat /tmp/temporal.pid)" 2>/dev/null; then
+            echo "the temporal dev server did not survive the previous step:"
+            tail -40 /tmp/temporal.log
+            exit 1
+          fi
+
+          nohup encore run --port 4000 > /tmp/encore.log 2>&1 &
+          echo $! > /tmp/encore.pid
+          disown
+
+          for i in $(seq 1 180); do
+            if curl -fsS --max-time 2 http://127.0.0.1:4000/health >/dev/null 2>&1; then
+              echo "api ready after ${i}s (pid $(cat /tmp/encore.pid))"; exit 0
+            fi
+            sleep 1
+          done
+          echo "api did not become healthy:"; tail -40 /tmp/encore.log; exit 1
+
+      - name: Run the end-to-end suite
+        env:
+          FEES_API_BASE_URL: http://127.0.0.1:4000
+        run: |
+          # pipefail, or tee would swallow a failing exit status and report green.
+          set -o pipefail
+          go test ./e2e/ -count=1 -v 2>&1 | tee /tmp/e2e.log
+
+      # A suite that silently skips, or that runs nothing at all, is worse than no
+      # suite: it reports success for assertions nobody made. This reads the run
+      # above rather than repeating it - re-running would exercise every case a
+      # second time against the same database, and under `bash -e` a failure in
+      # that second run would abort before any of its output was printed.
+      - name: Fail if the suite skipped or ran nothing
+        run: |
+          if grep -q -- '--- SKIP' /tmp/e2e.log; then
+            echo "end-to-end cases were skipped, so their assertions were never made:"
+            grep -- '--- SKIP' /tmp/e2e.log
+            exit 1
+          fi
+
+          passed="$(grep -c '^--- PASS' /tmp/e2e.log || true)"
+          if [ "$passed" -lt "$MIN_E2E_CASES" ]; then
+            echo "only $passed end-to-end cases ran, expected at least $MIN_E2E_CASES."
+            echo "Either cases were removed, or the suite stopped early."
+            exit 1
+          fi
+          echo "ran $passed end-to-end cases, none skipped"
+        env:
+          # Raise this when cases are added. It is the guard against a suite that
+          # quietly shrinks to nothing while still reporting success.
+          MIN_E2E_CASES: 17
+
+      - name: Show the logs on failure
+        if: failure()
+        run: |
+          echo "=== temporal ==="; tail -60 /tmp/temporal.log 2>/dev/null || echo "(no log)"
+          echo "=== api ==="; tail -120 /tmp/encore.log 2>/dev/null || echo "(no log)"

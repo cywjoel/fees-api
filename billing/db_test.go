@@ -74,9 +74,9 @@ func TestMigrationCreatesTheInvoiceSchema(t *testing.T) {
 	}
 }
 
-// Spec: billing/bill-lifecycle - "Closed bill remains retrievable long after
-// closure". Also task 5.2: the write must converge, because Temporal runs an
-// activity at least once and a retry must not duplicate a charge.
+// The write must converge: Temporal runs an activity at least once, so a worker
+// that completes the write and crashes before recording that it did will run it
+// again, and a retry must not duplicate a charge.
 func TestSaveInvoiceIsIdempotent(t *testing.T) {
 	ctx := context.Background()
 	snap := testSnapshot("bill_idem", bill.StateClosing,
@@ -266,5 +266,129 @@ func TestSaveInvoiceWithNoLineItems(t *testing.T) {
 	}
 	if len(got.LineItems) != 0 {
 		t.Errorf("line items = %d, want 0", len(got.LineItems))
+	}
+}
+
+// Spec: billing/bill-lifecycle - "Closed bill remains retrievable long after
+// closure", and "A closed bill SHALL remain retrievable indefinitely, and SHALL
+// NOT become unavailable through the passage of time".
+//
+// The passage of time itself cannot be tested here: what expires is Temporal's
+// history retention, twenty-four hours on the dev server and days to weeks in
+// production. What can be tested is the property that makes the requirement hold
+// - that the invoice is readable with no workflow in the picture at all.
+//
+// This test never starts one. It writes an invoice the way the closing activity
+// does and reads it back through the same function the API uses once a workflow
+// is gone, which is precisely the path a bill takes after its history has aged
+// out. A Temporal query is a view of live process state, not storage, and this is
+// the test that says so.
+func TestClosedInvoiceIsReadableWithNoWorkflowInvolved(t *testing.T) {
+	ctx := context.Background()
+
+	snap := testSnapshot("bill_outlives_its_workflow", bill.StateClosed,
+		testItem("txn_1", 1234, "card fee"),
+		testItem("txn_2", 66, "transfer fee"),
+	)
+	if err := saveInvoice(ctx, snap); err != nil {
+		t.Fatalf("saveInvoice returned error: %v", err)
+	}
+
+	got, err := loadInvoice(ctx, snap.ID)
+	if err != nil {
+		t.Fatalf("loadInvoice returned error: %v", err)
+	}
+
+	if got.State != bill.StateClosed {
+		t.Errorf("state = %s, want CLOSED", got.State)
+	}
+	if got.Total.MinorUnits() != 1300 {
+		t.Errorf("total = %d minor units, want 1300", got.Total.MinorUnits())
+	}
+	if !got.Total.Equal(snap.Total) {
+		t.Errorf("total = %s, want the %s it was closed with", got.Total, snap.Total)
+	}
+	if len(got.LineItems) != 2 {
+		t.Fatalf("line items = %d, want 2", len(got.LineItems))
+	}
+	for i, want := range snap.LineItems {
+		if got.LineItems[i].ID != want.ID || !got.LineItems[i].Amount.Equal(want.Amount) {
+			t.Errorf("line item %d = %s %s, want %s %s",
+				i, got.LineItems[i].ID, got.LineItems[i].Amount, want.ID, want.Amount)
+		}
+	}
+	if got.ClosedBy != snap.ClosedBy {
+		t.Errorf("closedBy = %q, want %q", got.ClosedBy, snap.ClosedBy)
+	}
+	if got.ClosedAt == nil {
+		t.Error("closedAt is absent; a closed invoice must record when it closed")
+	}
+}
+
+// A fee period stated with nanosecond precision survives a storage round trip
+// only as far as microseconds, because that is all a TIMESTAMPTZ column keeps.
+//
+// This is the failure that refused a correct retry as idempotency-key reuse: the
+// bill was compared against a period read back from Postgres, which no longer
+// equalled the one the caller sent. It only ever appeared once a bill's workflow
+// had aged out of history and storage became the only source for its period, so
+// no test reached it - the same blind spot that hid the original defect.
+func TestFeePeriodComparisonSurvivesStorageTruncation(t *testing.T) {
+	ctx := context.Background()
+
+	// What time.Now() produces and RFC3339Nano transports.
+	rawStart := time.Date(2026, 9, 12, 10, 0, 0, 123456789, time.UTC)
+	rawEnd := rawStart.Add(time.Hour)
+
+	// What CreateBill records, having taken the period to storage precision.
+	in := CreateBillRequest{
+		Currency:    "USD",
+		PeriodStart: atStoragePrecision(rawStart),
+		PeriodEnd:   atStoragePrecision(rawEnd),
+	}
+
+	snap := testSnapshot("bill_period_precision", bill.StateClosed, testItem("txn_1", 100, "fee"))
+	snap.PeriodStart = in.PeriodStart
+	snap.PeriodEnd = in.PeriodEnd
+
+	if err := saveInvoice(ctx, snap); err != nil {
+		t.Fatalf("saveInvoice returned error: %v", err)
+	}
+	stored, err := loadInvoice(ctx, snap.ID)
+	if err != nil {
+		t.Fatalf("loadInvoice returned error: %v", err)
+	}
+
+	usd := money.MustLookup("USD")
+
+	if !matchesRequest(stored, usd, in) {
+		t.Errorf("a retry of the request that created this bill was not recognised\n"+
+			"  sent    %s\n  stored  %s\n"+
+			"The caller would receive 409 idempotency_key_reuse for the request that "+
+			"created the bill, where the spec requires 200 with the existing bill.",
+			in.PeriodStart.Format(time.RFC3339Nano), stored.PeriodStart.UTC().Format(time.RFC3339Nano))
+	}
+
+	// Belt and braces: a caller whose request still carries nanoseconds - a bill
+	// created before the period was truncated on the way in - must match too.
+	untruncated := CreateBillRequest{Currency: "USD", PeriodStart: rawStart, PeriodEnd: rawEnd}
+	if !matchesRequest(stored, usd, untruncated) {
+		t.Errorf("an untruncated request did not match the bill it created\n"+
+			"  sent    %s\n  stored  %s",
+			rawStart.Format(time.RFC3339Nano), stored.PeriodStart.UTC().Format(time.RFC3339Nano))
+	}
+
+	// A genuinely different period must still be refused, or the comparison has
+	// been loosened into uselessness rather than corrected.
+	elsewhere := CreateBillRequest{
+		Currency:    "USD",
+		PeriodStart: rawStart.Add(48 * time.Hour),
+		PeriodEnd:   rawEnd.Add(48 * time.Hour),
+	}
+	if matchesRequest(stored, usd, elsewhere) {
+		t.Error("a request for a different fee period matched; the comparison no longer discriminates")
+	}
+	if matchesRequest(stored, money.MustLookup("GEL"), in) {
+		t.Error("a request in a different currency matched")
 	}
 }
