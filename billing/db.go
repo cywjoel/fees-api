@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"encore.dev/storage/sqldb"
@@ -53,11 +54,11 @@ func saveInvoice(ctx context.Context, snap bill.Snapshot) error {
 	if snap.ClosedAt == nil {
 		return fmt.Errorf("billing: refusing to persist bill %q with no closure time", snap.ID)
 	}
-	if snap.CustomerID == "" {
+	if strings.TrimSpace(snap.CustomerID) == "" {
 		// Checked here as well as by the column constraint, so the failure names
 		// itself instead of arriving as a constraint violation from the driver.
 		// Reachable only for a bill started before bills had customers.
-		return fmt.Errorf("billing: refusing to persist bill %q with no customer; "+
+		return fmt.Errorf("billing: refusing to persist bill %q with a blank customer; "+
 			"an invoice has to be billable to someone", snap.ID)
 	}
 

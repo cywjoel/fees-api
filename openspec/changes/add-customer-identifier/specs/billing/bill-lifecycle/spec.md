@@ -21,8 +21,14 @@ A fee period SHALL be recorded at a resolution the system can durably retain, an
 
 #### Scenario: Creation without a customer is rejected
 
-- **WHEN** a client requests a new bill without identifying a customer
+- **WHEN** a client requests a new bill without identifying a customer, or identifies one with a value containing no non-whitespace character
 - **THEN** the system responds `422 Unprocessable Content` and no bill is created
+- **AND** a value that is only whitespace is refused for the same reason an absent one is: it identifies nobody
+
+#### Scenario: An identifier's surrounding whitespace is part of it
+
+- **WHEN** a client creates a bill for a customer identifier that carries leading or trailing whitespace alongside other characters
+- **THEN** the bill is created and reports that identifier unchanged, because the system does not decide which customers exist and must not alter one it was given
 
 #### Scenario: Customer identifier is stored as given
 

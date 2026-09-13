@@ -1003,3 +1003,30 @@ func TestRetryNamingTheWrongCustomerIsRejected(t *testing.T) {
 		t.Errorf("reason = %q, want customer_mismatch", got.reason())
 	}
 }
+
+// A customer identifier made only of whitespace identifies nobody, and accepting
+// it defeats the point of requiring the field.
+func TestBlankCustomerIsRejected(t *testing.T) {
+	requireAPI(t)
+
+	for _, blank := range []string{"", " ", "   ", "\t"} {
+		b := createBillBody("USD", time.Hour)
+		b["customerId"] = blank
+		got := do(t, http.MethodPost, "/bills", b, nil)
+		if got.status != http.StatusUnprocessableEntity {
+			t.Errorf("customerId=%q -> %d, want 422 (%s)", blank, got.status, got.raw)
+		}
+	}
+
+	// Padding is content as far as this service is concerned: the identifier is
+	// opaque, and trimming it would change the bill id.
+	b := createBillBody("USD", time.Hour)
+	b["customerId"] = "  acme  "
+	got := do(t, http.MethodPost, "/bills", b, nil)
+	if got.status != http.StatusCreated {
+		t.Fatalf("a padded identifier -> %d, want 201 (%s)", got.status, got.raw)
+	}
+	if got.body["customerId"] != "  acme  " {
+		t.Errorf("customer reported as %v, want it unchanged", got.body["customerId"])
+	}
+}

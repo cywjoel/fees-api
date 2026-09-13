@@ -457,3 +457,36 @@ func TestOwnerlessInvoiceIsRefused(t *testing.T) {
 			"NOT NULL does not prevent this: '' is not NULL.", got.CustomerID)
 	}
 }
+
+// "Not empty" is not "has an owner": ' ' <> ” is true, so a whitespace-only
+// identifier satisfied the previous constraint and a bill owned by nothing
+// closed and persisted normally.
+//
+// The identifier stays opaque. What is rejected is a value with no content;
+// what is stored is whatever was sent, whitespace included.
+func TestBlankCustomerIsRefusedButPaddingIsPreserved(t *testing.T) {
+	ctx := context.Background()
+
+	for _, blank := range []string{"", " ", "   ", "\t", "\n", " \t \n "} {
+		snap := testSnapshot("bill_blank_"+fmt.Sprint(len(blank))+blank, bill.StateClosed)
+		snap.CustomerID = blank
+		if err := saveInvoice(ctx, snap); err == nil {
+			t.Errorf("a bill owned by %q was persisted; it is billable to nobody", blank)
+		}
+	}
+
+	padded := testSnapshot("bill_padded", bill.StateClosed, testItem("txn_1", 100, "fee"))
+	padded.CustomerID = "  acme  "
+	if err := saveInvoice(ctx, padded); err != nil {
+		t.Fatalf("an identifier with meaningful padding was refused: %v", err)
+	}
+	got, err := loadInvoice(ctx, padded.ID)
+	if err != nil {
+		t.Fatalf("loadInvoice returned error: %v", err)
+	}
+	if got.CustomerID != "  acme  " {
+		t.Errorf("customer stored as %q, want %q unchanged - trimming what is stored "+
+			"would change bill ids for anyone whose identifiers carry whitespace",
+			got.CustomerID, "  acme  ")
+	}
+}

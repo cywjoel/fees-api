@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"net/http"
 	"strconv"
+	"strings"
 	"time"
 
 	"encore.dev"
@@ -149,13 +150,17 @@ func (s *Service) CreateBill(w http.ResponseWriter, req *http.Request) {
 		return
 	}
 
-	if in.CustomerID == "" {
+	if strings.TrimSpace(in.CustomerID) == "" {
 		// Required here and not in the domain: bill.New must tolerate an empty
 		// customer so that histories recorded before this field existed still
 		// replay. This is the one place the requirement can be enforced without
 		// stranding a bill that is already running.
+		// Trimmed for the test, stored as given. A value that is only whitespace
+		// identifies nobody, and accepting it defeats the point of requiring the
+		// field at all - but an identifier that meaningfully carries surrounding
+		// whitespace is still kept exactly as sent, because it is opaque.
 		writeProblem(w, http.StatusUnprocessableEntity, billflow.ReasonInvalidBill,
-			"customerId is required; a bill exists to be invoiced to someone")
+			"customerId is required and cannot be blank; a bill exists to be invoiced to someone")
 		return
 	}
 
