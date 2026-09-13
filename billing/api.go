@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"strconv"
 	"time"
 
 	"encore.dev"
@@ -44,6 +45,7 @@ func temporalContext(req *http.Request) (context.Context, context.CancelFunc) {
 
 // CreateBillRequest opens a bill for a fee period.
 type CreateBillRequest struct {
+	CustomerID  string    `json:"customerId"`
 	Currency    string    `json:"currency"`
 	PeriodStart time.Time `json:"periodStart"`
 	PeriodEnd   time.Time `json:"periodEnd"`
@@ -52,6 +54,13 @@ type CreateBillRequest struct {
 // AddLineItemRequest accrues one charge. The item's identifier is the path
 // segment, not a body field: it identifies the resource being created.
 type AddLineItemRequest struct {
+	// CustomerID is optional. When present it must be the bill's customer.
+	//
+	// A checksum rather than an identity claim: the caller already chose the bill
+	// by its id, so this states what the caller believes and lets the system
+	// disagree. Optional because requiring it would force every caller to carry
+	// the customer alongside the bill id for a guarantee only some of them need.
+	CustomerID  string      `json:"customerId,omitempty"`
 	Amount      money.Money `json:"amount"`
 	Description string      `json:"description"`
 }
@@ -140,6 +149,16 @@ func (s *Service) CreateBill(w http.ResponseWriter, req *http.Request) {
 		return
 	}
 
+	if in.CustomerID == "" {
+		// Required here and not in the domain: bill.New must tolerate an empty
+		// customer so that histories recorded before this field existed still
+		// replay. This is the one place the requirement can be enforced without
+		// stranding a bill that is already running.
+		writeProblem(w, http.StatusUnprocessableEntity, billflow.ReasonInvalidBill,
+			"customerId is required; a bill exists to be invoiced to someone")
+		return
+	}
+
 	currency, err := money.Lookup(in.Currency)
 	if err != nil {
 		writeProblem(w, http.StatusUnprocessableEntity, billflow.ReasonUnsupportedCurrency,
@@ -168,7 +187,7 @@ func (s *Service) CreateBill(w http.ResponseWriter, req *http.Request) {
 		return
 	}
 
-	billID, keyed := billIDFor(req.Header.Get("Idempotency-Key"))
+	billID, keyed := billIDForCustomer(in.CustomerID, req.Header.Get("Idempotency-Key"))
 
 	// A key that has already produced a bill returns that bill rather than a
 	// second one. This covers the completed case too, where the workflow is gone
@@ -194,6 +213,7 @@ func (s *Service) CreateBill(w http.ResponseWriter, req *http.Request) {
 
 	started, err := s.startBillWorkflow(ctx, billID, billflow.StartBillInput{
 		BillID:      billID,
+		CustomerID:  in.CustomerID,
 		Currency:    currency.Code,
 		PeriodStart: in.PeriodStart,
 		PeriodEnd:   in.PeriodEnd,
@@ -342,6 +362,20 @@ func (s *Service) AddLineItem(w http.ResponseWriter, req *http.Request) {
 	if err := validateLineItemRequest(itemID, in); err != nil {
 		writeProblem(w, statusForDomainError(err), billflow.ClassifyRejection(err), err.Error())
 		return
+	}
+
+	if in.CustomerID != "" {
+		snap, readErr := s.readBill(ctx, billID)
+		switch {
+		case readErr == nil && snap.CustomerID != in.CustomerID:
+			writeProblem(w, http.StatusUnprocessableEntity, billflow.ReasonCustomerMismatch,
+				"this line item states customer "+in.CustomerID+" but bill "+billID+
+					" belongs to "+snap.CustomerID)
+			return
+		case readErr != nil && isWorkflowBusy(readErr):
+			writeUnavailable(w, "the bill's customer could not be read to check it: "+readErr.Error())
+			return
+		}
 	}
 
 	handle, err := s.temporal.UpdateWorkflow(ctx, client.UpdateWorkflowOptions{
@@ -589,6 +623,30 @@ func billIDFor(idempotencyKey string) (string, bool) {
 	}
 	sum := sha256.Sum256([]byte(idempotencyKey))
 	return "bill_" + hex.EncodeToString(sum[:])[:32], true
+}
+
+// billIDForCustomer derives a bill id from the customer and its idempotency key.
+//
+// The key identifies a request within a customer rather than across all of them.
+// Hashed globally, "september-2026" named one bill for every caller, so two fee
+// engines acting for different customers were handed the same bill and the
+// second accrued its charges onto the first customer's invoice.
+//
+// The boundary between the two fields is encoded, not marked. A customer
+// identifier is opaque, so no character can be reserved as a delimiter, and every
+// naive scheme has a colliding pair:
+//
+//	customer + key         ("acme","x") and ("acm","ex")   -> "acmex"
+//	customer + ":" + key   ("ac:me","x") and ("ac","me:x") -> "ac:me:x"
+//
+// Length-prefixing the customer removes both: the digest cannot be reached by
+// two different splits of the same bytes.
+func billIDForCustomer(customerID, idempotencyKey string) (string, bool) {
+	if idempotencyKey == "" {
+		return billIDFor("")
+	}
+	scoped := strconv.Itoa(len(customerID)) + ":" + customerID + idempotencyKey
+	return billIDFor(scoped)
 }
 
 // joinCodes renders supported currency codes for an error message.

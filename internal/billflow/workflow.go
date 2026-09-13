@@ -76,7 +76,15 @@ const (
 // and watch the bill close, which a hard-coded month would make impossible to
 // exercise by hand.
 type StartBillInput struct {
-	BillID      string    `json:"billId"`
+	BillID string `json:"billId"`
+
+	// CustomerID is the customer the bill belongs to.
+	//
+	// A history recorded before this field existed decodes it as empty, and the
+	// workflow must not branch on that: see bill.New. The requirement that a
+	// customer be supplied is enforced at the API boundary instead.
+	CustomerID string `json:"customerId"`
+
 	Currency    string    `json:"currency"`
 	PeriodStart time.Time `json:"periodStart"`
 	PeriodEnd   time.Time `json:"periodEnd"`
@@ -152,7 +160,7 @@ func BillWorkflow(ctx workflow.Context, in StartBillInput) (bill.Snapshot, error
 			err.Error(), ClassifyRejection(err), err)
 	}
 
-	b, err := bill.New(in.BillID, currency, in.PeriodStart, in.PeriodEnd, workflow.Now(ctx))
+	b, err := bill.New(in.BillID, in.CustomerID, currency, in.PeriodStart, in.PeriodEnd, workflow.Now(ctx))
 	if err != nil {
 		return bill.Snapshot{}, temporal.NewNonRetryableApplicationError(
 			err.Error(), ClassifyRejection(err), err)

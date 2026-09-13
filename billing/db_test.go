@@ -3,6 +3,7 @@ package billing
 import (
 	"context"
 	"errors"
+	"fmt"
 	"testing"
 	"time"
 
@@ -27,6 +28,7 @@ func testSnapshot(billID string, state bill.State, items ...bill.LineItem) bill.
 		items = []bill.LineItem{}
 	}
 	return bill.Snapshot{
+		CustomerID:  "acme",
 		ID:          billID,
 		State:       state,
 		Currency:    testUSD,
@@ -390,5 +392,48 @@ func TestFeePeriodComparisonSurvivesStorageTruncation(t *testing.T) {
 	}
 	if matchesRequest(stored, money.MustLookup("GEL"), in) {
 		t.Error("a request in a different currency matched")
+	}
+}
+
+// Spec: billing/bill-lifecycle - "The customer survives the workflow".
+//
+// A closed bill is read from storage once its workflow has gone, so the customer
+// has to make the trip through Postgres. This is the same path the fee period's
+// precision defect lived on, and the one CI never exercises end to end.
+func TestCustomerSurvivesStorage(t *testing.T) {
+	ctx := context.Background()
+	snap := testSnapshot("bill_customer_roundtrip", bill.StateClosed, testItem("txn_1", 500, "card fee"))
+	snap.CustomerID = "acme-holdings-gmbh"
+
+	if err := saveInvoice(ctx, snap); err != nil {
+		t.Fatalf("saveInvoice returned error: %v", err)
+	}
+	got, err := loadInvoice(ctx, snap.ID)
+	if err != nil {
+		t.Fatalf("loadInvoice returned error: %v", err)
+	}
+	if got.CustomerID != "acme-holdings-gmbh" {
+		t.Errorf("customer = %q, want the one it was closed with", got.CustomerID)
+	}
+}
+
+// The identifier is opaque: stored and returned unchanged, whatever its shape.
+func TestCustomerIdentifierIsOpaque(t *testing.T) {
+	ctx := context.Background()
+	for i, id := range []string{
+		"cus_01JB2K9XQZ", "acme", "urn:acct:1234", "  spaced  ", "混合-文字",
+	} {
+		snap := testSnapshot(fmt.Sprintf("bill_opaque_%d", i), bill.StateClosed)
+		snap.CustomerID = id
+		if err := saveInvoice(ctx, snap); err != nil {
+			t.Fatalf("saveInvoice(%q) returned error: %v", id, err)
+		}
+		got, err := loadInvoice(ctx, snap.ID)
+		if err != nil {
+			t.Fatalf("loadInvoice(%q) returned error: %v", id, err)
+		}
+		if got.CustomerID != id {
+			t.Errorf("customer round-tripped as %q, want %q unchanged", got.CustomerID, id)
+		}
 	}
 }

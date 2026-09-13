@@ -20,6 +20,15 @@ var (
 	// rather than resolved by overwriting.
 	ErrLineItemConflict = errors.New("bill: line item id already used with different detail")
 
+	// ErrCustomerMismatch is returned when a line item states a customer that is
+	// not the one the bill belongs to.
+	//
+	// The caller already chose the bill by its identifier, so this does not tell
+	// the system who is being charged - it tells the system whether the caller and
+	// the bill agree. A fee engine that computes the wrong bill id otherwise
+	// charges the wrong customer in silence.
+	ErrCustomerMismatch = errors.New("bill: line item customer does not match the bill")
+
 	// ErrInvalidLineItem is returned when a line item is missing required detail.
 	ErrInvalidLineItem = errors.New("bill: line item is missing required detail")
 
@@ -77,6 +86,7 @@ type AddResult struct {
 // bill it is the invoice: the total charged and every line item comprising it.
 type Snapshot struct {
 	ID          string         `json:"id"`
+	CustomerID  string         `json:"customerId"`
 	State       State          `json:"state"`
 	Currency    money.Currency `json:"currency"`
 	PeriodStart time.Time      `json:"periodStart"`
@@ -97,6 +107,7 @@ type Snapshot struct {
 // have.
 type Bill struct {
 	id          string
+	customerID  string
 	currency    money.Currency
 	periodStart time.Time
 	periodEnd   time.Time
@@ -115,8 +126,24 @@ type Bill struct {
 	closedBy Trigger
 }
 
-// New opens a bill for a fee period.
-func New(id string, currency money.Currency, periodStart, periodEnd, createdAt time.Time) (*Bill, error) {
+// New opens a bill for a fee period, belonging to a customer.
+//
+// It deliberately does NOT reject an empty customer, and that omission is
+// load-bearing rather than an oversight.
+//
+// A bill's workflow may run for a month, and Temporal reconstructs a running one
+// by replaying its recorded history through whatever code is deployed now. A
+// history recorded before the customer existed decodes with an empty one -
+// legally and silently. Were this constructor to reject that, the workflow would
+// return before issuing any command, while the history it is being replayed
+// against records a timer and two activities. Replay would diverge, and every
+// bill open across the deploy would be stranded.
+//
+// The requirement that a customer be supplied therefore lives at the API
+// boundary, where it runs once per request and never on replay. A later
+// "tightening" here would break bills that are already running; the test for
+// this defends the omission.
+func New(id string, customerID string, currency money.Currency, periodStart, periodEnd, createdAt time.Time) (*Bill, error) {
 	if id == "" {
 		return nil, fmt.Errorf("%w: id is required", ErrInvalidBill)
 	}
@@ -129,6 +156,7 @@ func New(id string, currency money.Currency, periodStart, periodEnd, createdAt t
 	}
 	return &Bill{
 		id:          id,
+		customerID:  customerID,
 		currency:    currency,
 		periodStart: periodStart,
 		periodEnd:   periodEnd,
@@ -141,6 +169,10 @@ func New(id string, currency money.Currency, periodStart, periodEnd, createdAt t
 
 // ID returns the bill's identifier.
 func (b *Bill) ID() string { return b.id }
+
+// CustomerID returns the customer the bill belongs to. It is empty only for a
+// bill created before bills had owners; see New.
+func (b *Bill) CustomerID() string { return b.customerID }
 
 // State returns the bill's current lifecycle state.
 func (b *Bill) State() State { return b.state }
@@ -332,6 +364,7 @@ func (b *Bill) LineItems() []LineItem {
 func (b *Bill) Snapshot() Snapshot {
 	s := Snapshot{
 		ID:          b.id,
+		CustomerID:  b.customerID,
 		State:       b.state,
 		Currency:    b.currency,
 		PeriodStart: b.periodStart,

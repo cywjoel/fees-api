@@ -41,7 +41,15 @@ The service stores, compares and reports it, and interprets nothing. No format, 
 
 No new storage, no lookup table. The scoping falls out of the existing derivation, and the archived design's rule — uniqueness comes from Temporal rather than from a deduplication table — survives untouched.
 
-The separator must be a character that cannot appear in a customer identifier, or `("ac", "me:x")` and `("acme", "x")` collide. Since the identifier is opaque (decision 1) no character can be excluded, so the length of the customer must be encoded rather than relying on a delimiter — hash `len(customer) + ":" + customer + key`, or hash the two fields as separate writes into the digest. This is a small detail that silently reintroduces the exact defect being fixed if it is skipped.
+The boundary between the two fields must be encoded, not marked. Because the identifier is opaque (decision 1) no character can be reserved as a delimiter, and every naive scheme has a colliding pair:
+
+```
+  customer + key           ("acme","x") and ("acm","ex")   -> "acmex"
+  customer + ":" + key     ("ac:me","x") and ("ac","me:x") -> "ac:me:x"
+  len + ":" + customer+key  5:ac:mex   2:acme:x   4:acmex   3:acmex
+```
+
+So hash `len(customer) + ":" + customer + key`, or write the two fields as separate updates into the digest. This is a small detail that silently reintroduces the exact defect being fixed if it is skipped, and a fix that merely swaps concatenation for a separator does not escape it.
 
 *Alternative considered — a `(customer, key)` table.* Rejected: it adds a store to keep consistent with the workflow, which is the dual-write the architecture avoids everywhere else.
 

@@ -136,6 +136,7 @@ func createBill(t *testing.T, currency string, period time.Duration, headers map
 func createBillBody(currency string, period time.Duration) map[string]any {
 	now := time.Now().UTC()
 	return map[string]any{
+		"customerId":  "e2e-customer",
 		"currency":    currency,
 		"periodStart": now.Format(time.RFC3339Nano),
 		"periodEnd":   now.Add(period).Format(time.RFC3339Nano),
@@ -299,6 +300,7 @@ func TestKeyReusedWithDifferentParametersIsRejected(t *testing.T) {
 
 	now := time.Now().UTC().Add(720 * time.Hour)
 	second := do(t, http.MethodPost, "/bills", map[string]any{
+		"customerId":  "e2e-customer",
 		"currency":    "GEL",
 		"periodStart": now.Format(time.RFC3339Nano),
 		"periodEnd":   now.Add(time.Hour).Format(time.RFC3339Nano),
@@ -324,6 +326,7 @@ func TestKeyReuseComparesInstantsNotRepresentations(t *testing.T) {
 	end := start.Add(time.Hour)
 
 	first := do(t, http.MethodPost, "/bills", map[string]any{
+		"customerId":  "e2e-customer",
 		"currency":    "USD",
 		"periodStart": start.Format(time.RFC3339),
 		"periodEnd":   end.Format(time.RFC3339),
@@ -334,6 +337,7 @@ func TestKeyReuseComparesInstantsNotRepresentations(t *testing.T) {
 
 	elsewhere := time.FixedZone("UTC+4", 4*60*60)
 	second := do(t, http.MethodPost, "/bills", map[string]any{
+		"customerId":  "e2e-customer",
 		"currency":    "USD",
 		"periodStart": start.In(elsewhere).Format(time.RFC3339),
 		"periodEnd":   end.In(elsewhere).Format(time.RFC3339),
@@ -355,6 +359,7 @@ func TestFeePeriodAlreadyEndedIsRejected(t *testing.T) {
 
 	start := time.Now().UTC().Add(-720 * time.Hour)
 	got := do(t, http.MethodPost, "/bills", map[string]any{
+		"customerId":  "e2e-customer",
 		"currency":    "USD",
 		"periodStart": start.Format(time.RFC3339Nano),
 		"periodEnd":   start.Add(24 * time.Hour).Format(time.RFC3339Nano),
@@ -765,6 +770,7 @@ func TestCreateBillValidation(t *testing.T) {
 		{
 			name: "period ends before it begins",
 			body: map[string]any{
+				"customerId":  "e2e-customer",
 				"currency":    "USD",
 				"periodStart": now.Format(time.RFC3339Nano),
 				"periodEnd":   now.Add(-time.Hour).Format(time.RFC3339Nano),
@@ -774,6 +780,7 @@ func TestCreateBillValidation(t *testing.T) {
 		{
 			name: "period ends exactly when it begins",
 			body: map[string]any{
+				"customerId":  "e2e-customer",
 				"currency":    "USD",
 				"periodStart": now.Format(time.RFC3339Nano),
 				"periodEnd":   now.Format(time.RFC3339Nano),
@@ -783,6 +790,7 @@ func TestCreateBillValidation(t *testing.T) {
 		{
 			name: "unsupported currency",
 			body: map[string]any{
+				"customerId":  "e2e-customer",
 				"currency":    "EUR",
 				"periodStart": now.Format(time.RFC3339Nano),
 				"periodEnd":   now.Add(time.Hour).Format(time.RFC3339Nano),
@@ -866,4 +874,101 @@ func TestAmountsCrossTheWireAsStrings(t *testing.T) {
 	if amount, _ := total["amount"].(string); amount != "0.10" {
 		t.Errorf("total.amount = %q, want \"0.10\"", amount)
 	}
+}
+
+// --- 1.1, 6.x: the customer, end to end ------------------------------------
+
+// The defect this change exists to fix: a key hashed globally named one bill for
+// every caller, so the second caller accrued its customer's charges onto the
+// first customer's invoice.
+func TestSameIdempotencyKeyForTwoCustomersMakesTwoBills(t *testing.T) {
+	requireAPI(t)
+
+	key := fmt.Sprintf("shared-%d", time.Now().UnixNano())
+	body := func(customer string) map[string]any {
+		b := createBillBody("USD", time.Hour)
+		b["customerId"] = customer
+		return b
+	}
+
+	first := do(t, http.MethodPost, "/bills", body("acme"), map[string]string{"Idempotency-Key": key})
+	second := do(t, http.MethodPost, "/bills", body("globex"), map[string]string{"Idempotency-Key": key})
+
+	if first.status != http.StatusCreated || second.status != http.StatusCreated {
+		t.Fatalf("statuses = %d and %d, want 201 and 201 (%s / %s)",
+			first.status, second.status, first.raw, second.raw)
+	}
+	if billIDOf(t, first) == billIDOf(t, second) {
+		t.Fatalf("one bill id for two customers (%s)\n\n"+
+			"Whichever caller arrives second receives the other customer's bill.",
+			billIDOf(t, first))
+	}
+	if got := second.body["customerId"]; got != "globex" {
+		t.Errorf("second bill belongs to %v, want globex", got)
+	}
+}
+
+func TestCreationWithoutACustomerIsRejected(t *testing.T) {
+	requireAPI(t)
+
+	b := createBillBody("USD", time.Hour)
+	delete(b, "customerId")
+
+	got := do(t, http.MethodPost, "/bills", b, nil)
+	if got.status != http.StatusUnprocessableEntity {
+		t.Fatalf("status = %d, want 422 (%s)", got.status, got.raw)
+	}
+	if id, ok := got.body["id"].(string); ok && id != "" {
+		t.Errorf("a bill was created (%s) with no owner", id)
+	}
+}
+
+// The line item's customer is a checksum: it says what the caller believes, and
+// lets the system disagree before the wrong customer is charged.
+func TestLineItemCustomerIsCheckedAgainstTheBill(t *testing.T) {
+	requireAPI(t)
+
+	b := createBillBody("USD", time.Hour)
+	b["customerId"] = "acme"
+	billID := billIDOf(t, do(t, http.MethodPost, "/bills", b, nil))
+
+	item := func(customer string, minor int64) map[string]any {
+		body := lineItemBody(minor, "USD", "card fee")
+		if customer != "" {
+			body["customerId"] = customer
+		}
+		return body
+	}
+
+	t.Run("matching customer is accepted", func(t *testing.T) {
+		got := do(t, http.MethodPut, lineItemPath(billID, "txn_match"), item("acme", 500), nil)
+		if got.status != http.StatusCreated {
+			t.Fatalf("status = %d, want 201 (%s)", got.status, got.raw)
+		}
+	})
+
+	t.Run("no customer stated is accepted, since the check is optional", func(t *testing.T) {
+		got := do(t, http.MethodPut, lineItemPath(billID, "txn_silent"), item("", 100), nil)
+		if got.status != http.StatusCreated {
+			t.Fatalf("status = %d, want 201 (%s)", got.status, got.raw)
+		}
+	})
+
+	t.Run("a different customer is rejected", func(t *testing.T) {
+		got := do(t, http.MethodPut, lineItemPath(billID, "txn_wrong"), item("globex", 900), nil)
+		if got.status != http.StatusUnprocessableEntity {
+			t.Fatalf("status = %d, want 422 (%s)", got.status, got.raw)
+		}
+		if got.reason() != "customer_mismatch" {
+			t.Errorf("reason = %q, want customer_mismatch - distinct from a currency "+
+				"mismatch and from a bill that is not open", got.reason())
+		}
+	})
+
+	t.Run("the rejected charge left the bill alone", func(t *testing.T) {
+		final := do(t, http.MethodGet, "/bills/"+billID, nil, nil)
+		if got := final.totalMinorUnits(t); got != 600 {
+			t.Errorf("total = %d minor units, want 600: the rejected charge was applied", got)
+		}
+	})
 }

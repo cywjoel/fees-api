@@ -170,7 +170,7 @@ jobs:
         env:
           # Raise this when cases are added. It is the guard against a suite that
           # quietly shrinks to nothing while still reporting success.
-          MIN_E2E_CASES: 17
+          MIN_E2E_CASES: 20
 
       - name: Show the logs on failure
         if: failure()

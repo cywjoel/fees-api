@@ -19,7 +19,7 @@ var (
 
 func newOpenBill(t *testing.T) *bill.Bill {
 	t.Helper()
-	b, err := bill.New("bill_test", usd, periodStart, periodEnd, periodStart)
+	b, err := bill.New("bill_test", "acme", usd, periodStart, periodEnd, periodStart)
 	if err != nil {
 		t.Fatalf("New returned error: %v", err)
 	}
@@ -64,7 +64,7 @@ func TestNewBillRejectsInvalidPeriod(t *testing.T) {
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			if _, err := bill.New("b", usd, tc.start, tc.end, tc.start); !errors.Is(err, bill.ErrInvalidPeriod) {
+			if _, err := bill.New("b", "acme", usd, tc.start, tc.end, tc.start); !errors.Is(err, bill.ErrInvalidPeriod) {
 				t.Fatalf("New error = %v, want ErrInvalidPeriod", err)
 			}
 		})
@@ -72,10 +72,10 @@ func TestNewBillRejectsInvalidPeriod(t *testing.T) {
 }
 
 func TestNewBillRequiresIDAndCurrency(t *testing.T) {
-	if _, err := bill.New("", usd, periodStart, periodEnd, periodStart); !errors.Is(err, bill.ErrInvalidBill) {
+	if _, err := bill.New("", "acme", usd, periodStart, periodEnd, periodStart); !errors.Is(err, bill.ErrInvalidBill) {
 		t.Errorf("New with empty id error = %v, want ErrInvalidBill", err)
 	}
-	if _, err := bill.New("b", money.Currency{}, periodStart, periodEnd, periodStart); !errors.Is(err, bill.ErrInvalidBill) {
+	if _, err := bill.New("b", "acme", money.Currency{}, periodStart, periodEnd, periodStart); !errors.Is(err, bill.ErrInvalidBill) {
 		t.Errorf("New with zero currency error = %v, want ErrInvalidBill", err)
 	}
 }
@@ -656,5 +656,44 @@ func TestCheckAgainstSnapshotAgreesWithTheLivePath(t *testing.T) {
 				t.Fatalf("live path returned %v but storage path returned %v", liveErr, snapErr)
 			}
 		})
+	}
+}
+
+// --- 2.1, 2.2 --------------------------------------------------------------
+
+func TestBillCarriesItsCustomer(t *testing.T) {
+	b, err := bill.New("bill_1", "acme", usd,
+		time.Now(), time.Now().Add(time.Hour), time.Now())
+	if err != nil {
+		t.Fatalf("New returned error: %v", err)
+	}
+	if b.CustomerID() != "acme" {
+		t.Errorf("CustomerID() = %q, want acme", b.CustomerID())
+	}
+	if b.Snapshot().CustomerID != "acme" {
+		t.Errorf("snapshot customer = %q, want acme", b.Snapshot().CustomerID)
+	}
+}
+
+// bill.New must accept an empty customer, and this test defends that omission
+// rather than the behaviour being incidental.
+//
+// A workflow history recorded before bills had owners decodes with an empty
+// customer. Were New to reject it, replaying such a history would return before
+// issuing any command, while the history records a timer and two activities -
+// the replay diverges and every bill open across the deploy is stranded.
+//
+// So a later "tightening" of this constructor must fail here, loudly, with this
+// explanation, rather than look like an obvious improvement.
+func TestNewAcceptsAnEmptyCustomerSoReplaySurvives(t *testing.T) {
+	b, err := bill.New("bill_pre_customer", "", usd,
+		time.Now(), time.Now().Add(time.Hour), time.Now())
+	if err != nil {
+		t.Fatalf("New rejected an empty customer: %v\n\n"+
+			"This breaks replay of every workflow history recorded before the customer "+
+			"field existed. The requirement belongs at the API boundary, not here.", err)
+	}
+	if b.CustomerID() != "" {
+		t.Errorf("CustomerID() = %q, want empty", b.CustomerID())
 	}
 }
