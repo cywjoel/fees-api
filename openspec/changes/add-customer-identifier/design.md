@@ -113,7 +113,13 @@ Nullability is decided by the migration, not here.
 
 - **The hash separator.** Concatenating customer and key without encoding a boundary makes `("ac","me:x")` and `("acme","x")` the same bill — reintroducing the collision this change exists to fix, in a form that is harder to spot. → Length-prefix the customer, or write the fields separately into the digest, and test the adjacent-boundary case explicitly.
 
-- **Every new bill id is unlike every old one.** Ids are opaque so nothing should care, but anything that memorised a bill id derived from an unscoped key will not find it again by recomputing. → Nothing in this repo recomputes ids; an external caller that does must be told.
+- **Every keyed bill id changes, so a retry spanning the deploy would create a second bill.** Scoping the key changes how every keyed id is derived. A client that created a bill before the change and retries afterwards computes an id its original request never used, the pre-check misses, and a second bill is started for a period already being billed — the customer billed twice, silently. The recomputation that matters happens in the client, on a retry, not in this repo.
+
+  → **This change assumes no such bill exists, and that assumption is checked rather than hoped for.** The customer field exists only on this branch; `main` has never carried it and has never run outside a developer machine. The store was reset when `customer_id` was introduced, and at the time of writing there are no invoices with an empty customer and no workflow whose start input lacks the field. The hazard is real but its population is empty.
+
+  → **If that ever stops being true** — if this is deployed over a version that has been running and accruing bills — the fix is a fallback in `CreateBill` that also looks up the unscoped id. Two things make that harder than it sounds, and both were found by building it: a bill with no customer cannot be persisted at all under the constraint above, so adopting one hands the caller a bill whose close is guaranteed to fail; and "has no customer" is the only guard available, which is true of every legacy bill whoever asks, so two customers retrying one key would both adopt it — the collision this change removes, reachable through the migration path. A fallback would therefore have to *stamp* the customer onto the bill it adopts, not merely return it.
+
+  → Preserving continuity for workflows would also contradict the migration decision already taken for the database, which was to accept the discontinuity rather than migrate. Both stores are treated the same way: nothing predating this change is carried forward.
 
 - **A required field at the boundary rejects callers that have not been updated.** There is no grace period: the first request without a customer gets `422`. → Acceptable for a service with a small, known set of callers; would need a deprecation window otherwise.
 

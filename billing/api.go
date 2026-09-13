@@ -210,28 +210,6 @@ func (s *Service) CreateBill(w http.ResponseWriter, req *http.Request) {
 			return
 		}
 
-		// A retry that spans the change to scoped keys.
-		//
-		// Scoping the key changed how every keyed bill id is derived, so a retry
-		// issued after that change computes an id its original request never used
-		// and finds nothing - and a second bill is created for a period that is
-		// already being billed. The old id is therefore tried as well.
-		//
-		// Only a bill with no customer is adopted: those are exactly the bills
-		// created before the field existed. One that has a customer belongs to the
-		// scoped scheme and must not be reachable by an unscoped id, or the
-		// collision this change removed would be reachable again through the back
-		// door.
-		//
-		// Remove this once no bill predating scoped keys can still be retried.
-		if legacyID, _ := billIDFor(req.Header.Get("Idempotency-Key")); legacyID != billID {
-			if snap, readErr := s.readBill(ctx, legacyID); readErr == nil &&
-				snap.CustomerID == "" && matchesRequest(snap, currency, in) {
-				w.Header().Set("Location", "/bills/"+legacyID)
-				writeJSON(w, http.StatusOK, snap)
-				return
-			}
-		}
 	}
 
 	started, err := s.startBillWorkflow(ctx, billID, billflow.StartBillInput{

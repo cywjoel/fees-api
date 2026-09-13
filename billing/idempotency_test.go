@@ -85,10 +85,16 @@ func TestNoKeyYieldsDistinctUnkeyedBills(t *testing.T) {
 	}
 }
 
-// Finding 1: scoping the key changed how every keyed bill id is derived, so a
-// retry issued after the change computes an id its original request never used.
-// Without a fallback the pre-check finds nothing and a second bill is created
-// for a period already being billed - the customer billed twice, silently.
+// Scoping the key changed how every keyed bill id is derived, so a retry issued
+// before the change and repeated afterwards would look for an id its original
+// request never used - and a second bill would be created for a period already
+// being billed.
+//
+// No such bill exists: the customer field has only ever existed on this change,
+// the store was reset when it was introduced, and the constraint on customer_id
+// forbids one being created now. This records the arithmetic that makes the
+// hazard real, so that anyone deploying this over a version that HAS been
+// running recognises what they are looking at. See design.md, Risks.
 func TestLegacyAndScopedIdsDiffer(t *testing.T) {
 	legacy, _ := billIDFor("september-2026")
 	scoped, _ := billIDForCustomer("acme", "september-2026")
