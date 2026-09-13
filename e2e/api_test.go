@@ -972,3 +972,34 @@ func TestLineItemCustomerIsCheckedAgainstTheBill(t *testing.T) {
 		}
 	})
 }
+
+// The checksum has to fire on a retry, which is the one case it exists for: a
+// fee engine that computed the wrong bill id and is re-sending would otherwise
+// be told its charge is present on a bill belonging to someone else.
+func TestRetryNamingTheWrongCustomerIsRejected(t *testing.T) {
+	requireAPI(t)
+
+	b := createBillBody("USD", time.Hour)
+	b["customerId"] = "acme"
+	billID := billIDOf(t, do(t, http.MethodPost, "/bills", b, nil))
+
+	first := do(t, http.MethodPut, lineItemPath(billID, "txn_a"),
+		lineItemBody(500, "USD", "card fee"), nil)
+	if first.status != http.StatusCreated {
+		t.Fatalf("first addition = %d, want 201 (%s)", first.status, first.raw)
+	}
+
+	body := lineItemBody(500, "USD", "card fee")
+	body["customerId"] = "globex"
+	got := do(t, http.MethodPut, lineItemPath(billID, "txn_a"), body, nil)
+
+	if got.status != http.StatusUnprocessableEntity {
+		t.Fatalf("status = %d, want 422 (%s)\n\n"+
+			"A 200 here tells a caller that reached the wrong bill that its charge is "+
+			"already present, which is the silent mischarge the checksum exists to catch.",
+			got.status, got.raw)
+	}
+	if got.reason() != "customer_mismatch" {
+		t.Errorf("reason = %q, want customer_mismatch", got.reason())
+	}
+}

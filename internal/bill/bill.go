@@ -222,10 +222,21 @@ func validateLineItem(item LineItem) error {
 // chose the bill by its identifier, so this establishes whether the caller and
 // the bill agree, not who is being charged.
 //
-// It is checked in the same position as the currency, after the state check, so
-// that a charge arriving at a closed bill is reported as too late whichever way
-// it is also malformed. Checking it earlier made the two analogous checksums
-// answer differently on the same bill.
+// It is checked first, before deduplication and before the state check, and that
+// position is deliberate rather than incidental.
+//
+// The customer assertion is not the same kind of check as the currency, though
+// the two look alike. The currency asks whether this charge is compatible with
+// this bill, which only matters once the bill can accept charges at all - so it
+// belongs after the state check. The customer asks whether this is the right bill
+// in the first place. If it is not, nothing that follows is meaningful: whether
+// the bill is open, and whether it already carries an item with this id, are
+// facts about a bill the caller did not mean to address.
+//
+// Checking it after deduplication made the checksum silent exactly where it was
+// most needed. A fee engine that computes the wrong bill id and re-sends was told
+// "already accrued" for a charge sitting on someone else's invoice, because an
+// item with that id happened to exist there.
 //
 // An empty assertion is not a mismatch. A workflow history recorded before the
 // field existed decodes it as empty, so treating absence as disagreement would
@@ -233,6 +244,11 @@ func validateLineItem(item LineItem) error {
 func (b *Bill) checkLineItem(item LineItem, assertCustomerID string) (*LineItem, error) {
 	if err := validateLineItem(item); err != nil {
 		return nil, err
+	}
+
+	if assertCustomerID != "" && assertCustomerID != b.customerID {
+		return nil, fmt.Errorf("%w: bill %q belongs to %q, line item states %q",
+			ErrCustomerMismatch, b.id, b.customerID, assertCustomerID)
 	}
 
 	// Deduplication precedes the state check. An identical retry of an item that
@@ -249,10 +265,6 @@ func (b *Bill) checkLineItem(item LineItem, assertCustomerID string) (*LineItem,
 
 	if !AcceptsLineItems(b.state) {
 		return nil, fmt.Errorf("%w: %q is in %s", ErrNotOpen, b.id, b.state)
-	}
-	if assertCustomerID != "" && assertCustomerID != b.customerID {
-		return nil, fmt.Errorf("%w: bill %q belongs to %q, line item states %q",
-			ErrCustomerMismatch, b.id, b.customerID, assertCustomerID)
 	}
 	if item.Amount.Currency().Code != b.currency.Code {
 		return nil, fmt.Errorf("%w: bill %q is denominated in %s, line item is in %s",
@@ -273,13 +285,16 @@ func (b *Bill) checkLineItem(item LineItem, assertCustomerID string) (*LineItem,
 // It returns the already-accrued item when the addition is an identical retry,
 // ErrLineItemConflict when the identifier was reused with different detail, and
 // ErrNotOpen when the charge is genuinely new and has arrived too late.
-//
-// assertCustomerID is accepted for symmetry with the live path and deliberately
-// unused; see the comment at the end of the function.
 func CheckAgainstSnapshot(snap Snapshot, item LineItem, assertCustomerID string) (*LineItem, error) {
-	_ = assertCustomerID
 	if err := validateLineItem(item); err != nil {
 		return nil, err
+	}
+
+	// First, as on the live path: addressing the wrong bill makes everything
+	// after it a fact about a bill the caller did not mean to reach.
+	if assertCustomerID != "" && assertCustomerID != snap.CustomerID {
+		return nil, fmt.Errorf("%w: bill %q belongs to %q, line item states %q",
+			ErrCustomerMismatch, snap.ID, snap.CustomerID, assertCustomerID)
 	}
 	for _, existing := range snap.LineItems {
 		if existing.ID != item.ID {
@@ -296,16 +311,6 @@ func CheckAgainstSnapshot(snap Snapshot, item LineItem, assertCustomerID string)
 		return nil, fmt.Errorf("%w: %q is in %s and should be answered by its workflow",
 			ErrNotOpen, snap.ID, snap.State)
 	}
-	// The customer is deliberately not compared here, and the asymmetry with the
-	// live path is only apparent. A bill read back from storage has always left
-	// OPEN, so a new charge is refused as too late whatever else is wrong with
-	// it - exactly as the live path refuses one in the wrong currency. Comparing
-	// the customer first would make a closed bill answer 422 where the live path
-	// answers 409, for two checks the design holds out as analogous.
-	//
-	// A retry of a charge already on the invoice is answered above, before any of
-	// this, so an assertion accompanying one is immaterial: the charge is present
-	// either way.
 	return nil, fmt.Errorf("%w: %q is in %s", ErrNotOpen, snap.ID, snap.State)
 }
 

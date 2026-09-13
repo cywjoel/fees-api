@@ -95,13 +95,33 @@ So `bill.New` must not gain a required-customer check. The requirement lives in 
 
 *The consequence to accept:* the workflow will carry an empty customer for bills started before this change, for as long as those bills run. That is correct — it is what those bills actually had — and it is why the storage column cannot be `NOT NULL` without a decision about them (see Migration Plan).
 
-### 4. The line item customer is a checksum, not an identity
+### 4. The line item customer is a routing check, not a compatibility one
 
 Optional on the request; when present it must equal the bill's, else `422`.
 
-The caller already chose the bill by id, so the field tells the system nothing about who is being charged — only whether the caller and the bill agree. A fee engine that computes the wrong bill id currently charges the wrong customer silently, and the error surfaces when a human reads an invoice.
+The caller already chose the bill by id, so the field tells the system nothing about who is being charged — only whether the caller and the bill agree. A fee engine that computes the wrong bill id otherwise charges the wrong customer silently, and the error surfaces when a human reads an invoice.
 
-This is the same argument, and the same status code, as the currency check the API already performs. It is deliberately not required: making it mandatory would force every caller to carry the customer alongside the bill id for a guarantee only some of them need.
+It is deliberately not required: making it mandatory would force every caller to carry the customer alongside the bill id for a guarantee only some of them need.
+
+**It is compared first — before deduplication and before the state check — and it is not the analogue of the currency check.** That distinction was got wrong twice while building this, in both directions, so it is worth stating precisely:
+
+```
+  currency   "is this charge compatible with this bill?"
+             only meaningful once the bill can accept charges
+             -> after the state check
+
+  customer   "is this the right bill at all?"
+             if not, nothing after it is meaningful: whether the bill
+             is open, and whether it already holds this item id, are
+             facts about a bill the caller did not mean to address
+             -> before everything
+```
+
+The consequence is visible and intended: on a **closed** bill, a charge in the wrong currency answers `409 bill_not_open` while one naming the wrong customer answers `422 customer_mismatch`. Those differ because the questions differ, not because the checks are inconsistent.
+
+Placing it after deduplication — which an earlier attempt did, reasoning from the false analogy above — made the checksum silent exactly where it was most needed. A fee engine that computed the wrong bill id and re-sent was answered `200 already_accrued`, because an item with that id happened to exist on the bill it reached, and concluded the fee was on its own customer's invoice. The one case the checksum exists to catch was the one case it did not.
+
+Both the live path and the storage path compare in this position, and the test that asserts the two agree exercises the assertion — it did not at first, which is how the disagreement survived a review.
 
 ### 5. Storage
 

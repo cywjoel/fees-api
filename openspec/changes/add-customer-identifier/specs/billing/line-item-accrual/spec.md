@@ -24,6 +24,18 @@ This is a checksum rather than an identity claim. The caller already chose the b
 - **THEN** the system responds `422 Unprocessable Content`, no line item is added, and the bill's total is unchanged
 - **AND** the rejection identifies the disagreement as the reason, distinctly from a malformed charge or one arriving too late
 
+#### Scenario: Retry of an accrued item naming a different customer is rejected
+
+- **WHEN** a client retries an addition whose item identifier is already on the bill, but states a customer other than the one the bill belongs to
+- **THEN** the system responds `422 Unprocessable Content` rather than reporting the charge as already accrued
+- **AND** it does so because the assertion is checked before the identifier is looked up: a caller that reached the wrong bill must not be told its charge is present there
+
+#### Scenario: Customer disagreement outranks the bill's state
+
+- **WHEN** a client adds a line item naming a customer other than the one the bill belongs to, to a bill that is no longer `OPEN`
+- **THEN** the system responds `422 Unprocessable Content` for the disagreement, not `409 Conflict` for the state
+- **AND** this differs from a currency mismatch on the same bill, which is answered `409`, because a wrong currency asks whether the charge suits the bill while a wrong customer asks whether it is the right bill at all
+
 #### Scenario: Line item is missing required detail
 
 - **WHEN** a client adds a line item without an amount, without a currency, or without an identifier
