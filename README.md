@@ -7,7 +7,7 @@ Each bill is a **Temporal workflow execution** rather than a row in a table. A f
 period may run for a month, during which the bill takes concurrent writes, must
 close on a wall-clock deadline, and must survive deploys and crashes without
 losing or duplicating a charge. Modelling it as a durable process addresses all
-four directly; the reasoning is in [Why Temporal](#why-temporal).
+four directly.
 
 ```
   POST /bills                        ->  start workflow (id = bill id)
@@ -178,63 +178,6 @@ currencies are `GEL` and `USD`.
 
 ---
 
-## Why Temporal
-
-Not as a queue. As a **serialised, durable, single-writer entity with a built-in
-month-long timer**. Four specific problems, each with the test that demonstrates
-it:
-
-**1. Concurrent writes, without locks.** A workflow executes as a single-threaded
-deterministic coroutine scheduler, so concurrent additions to one bill are ordered
-by construction — no row lock, no optimistic-concurrency retry, no lost update.
-
-**2. A deadline that survives everything.** The period timer is durable. Restart
-the worker mid-period and the bill still closes on time.
-
-**3. The close race stops existing.** Two triggers can close a bill: a request and
-the deadline. Both run on the same thread, so whichever reaches the state first
-wins and the loser is a no-op. This rests on update handlers being **yield-free** —
-they validate, mutate in memory, and return, while all waiting happens in the main
-loop. A handler that called an activity would suspend mid-transition and the timer
-could fire inside that window, leaving a bill half-closed.
-
-  `TestCloseRaceAgainstPeriodEndResolvesDeterministically` proves the outcome
-  flips one nanosecond either side of the deadline. `TestUpdateHandlersAreYieldFree`
-  parses the source and fails if a handler ever reaches a yield point.
-
-**4. Reliable hand-off.** Invoice emission is an activity with a bounded retry
-policy. While it fails the bill sits visibly in `CLOSING` with totals already
-frozen — which is why `CLOSING` is a state and not an instant.
-
-  `TestInvoiceHandOffIsRetriedUntilItSucceeds` fails the hand-off twice and
-  asserts the bill still reaches `CLOSED` with its total intact.
-
-And one Temporal-specific hazard worth naming: **update delivery is at-least-once**,
-so a client retry would double-charge without deduplication. Line items are keyed
-by a caller-supplied id — a fee is caused by something that already has an
-identity, so the invariant is real: *the fee for a given source event appears at
-most once on this bill*.
-
-The id is deliberately **not** reused as the Temporal update id. Temporal
-deduplicates by update id *before* the validator runs, so a conflicting reuse
-would be answered from the first result and the `409` would never be raised. The
-caller would be told its charge was accepted while a contradictory one was
-silently discarded. Deduplication belongs to the domain, which can tell an
-identical retry from a conflicting reuse.
-
-### A query is not a database
-
-Temporal answers `GET` while a bill is open. Once closed, the invoice is read from
-Postgres, written by an activity at the close. Workflow history is retained for a
-limited window — the local dev server defaults to **24 hours** — and a financial
-artifact has to outlive the process that produced it. Treating a query as durable
-storage is the most common Temporal anti-pattern, and not doing it is deliberate.
-
-The API layer never writes Postgres; only activities do. The workflow stays the
-single writer.
-
----
-
 ## Testing
 
 ```bash
@@ -278,29 +221,6 @@ is `workflow.GetVersion`.
 
 ---
 
-## Where Encore and Temporal rub
-
-Two honest seams, neither papered over.
-
-**The worker needs an owner.** Encore provisions its own infrastructure from
-declarations in code, but Temporal is not one of its resources, so the worker is
-an ordinary long-lived goroutine. An Encore service struct owns it: `initService`
-starts it, `Shutdown` drains it. See `billing/service.go`.
-
-**Status codes needed raw endpoints.** Encore's typed endpoints always return
-`200` on success and have no `422` in their error-code table, so `201`, `202`, and
-`422` are unreachable through them. Since the status codes here are load-bearing —
-`202` is what distinguishes "totals final, hand-off pending" from "done" — the bill
-endpoints are `//encore:api raw` and write their own responses. The cost is manual
-JSON handling and no auto-generated client; the alternative was an API that could
-not express its own state machine.
-
-A third, smaller one: `billing` cannot be tested with plain `go test`, because
-`sqldb.NewDatabase` panics outside the Encore runtime. CI runs that package under
-`encore test` and the rest under `go test`.
-
----
-
 ## Layout
 
 ```
@@ -314,7 +234,8 @@ internal/billflow/       the Temporal workflow — no Encore dependency
   testdata/              committed history fixtures for replay
 internal/money/          exact money: int64 minor units + ISO 4217
 e2e/                     end-to-end HTTP tests
-openspec/changes/fees-api/   proposal, specs, design, tasks
+openspec/specs/          the requirement contract: 22 requirements, 70 scenarios
+openspec/changes/        archive/ — three completed changes, each with a design.md
 ```
 
 `internal/bill` and `internal/money` import neither Temporal nor Encore, which is
@@ -327,5 +248,6 @@ retry behaviour are real. Also excluded: reopening a closed bill, listing or
 searching bills (read is by id), cross-currency settlement, and payment capture.
 
 Full reasoning, alternatives considered, and the requirements this was built
-against are in `openspec/changes/fees-api/` — `design.md` carries the twelve
-decisions and their rejected alternatives.
+against are in `openspec/`. `specs/` carries the contract; the three archived
+changes under `changes/archive/` carry 24 design decisions with the alternatives
+that were rejected.
